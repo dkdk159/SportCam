@@ -44,8 +44,8 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
     func start() {
         guard !running else { return }
         running = true
-        // 先用高精度换"马上有结果"，拿到地名后再放宽省电
-        manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+        // 百米精度就够反查街道了，要求太高系统会一直等更准的点，反而慢
+        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
         manager.distanceFilter = 25
         switch manager.authorizationStatus {
         case .notDetermined:
@@ -57,14 +57,38 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         }
     }
 
-    /// 立刻用系统缓存的位置出一版地名，再持续更新。
-    /// 只调 startUpdatingLocation 的话要等系统慢慢吐出第一个点，开关打开后好几秒才有地名。
+    /// 立刻出一版地名，别让用户干等：
+    /// 1) 先把上次记住的地名顶上去（通常还在同一个地方）；
+    /// 2) 有系统缓存位置就直接反查；
+    /// 3) 再要一次单次定位，拿更新的点来纠正。
     private func begin() {
+        if let cached = cachedPlace() {
+            DispatchQueue.main.async { self.onPlace?(cached) }
+        }
         manager.startUpdatingLocation()
-        if let cached = manager.location, abs(cached.timestamp.timeIntervalSinceNow) < 300 {
+        if let cached = manager.location, abs(cached.timestamp.timeIntervalSinceNow) < 600 {
             resolve(cached)
         }
-        manager.requestLocation()          // 再要一次单次定位，拿更新的点
+        manager.requestLocation()
+    }
+
+    // MARK: 地名缓存
+    private static let placeKey = "sportcam.watermark.place"
+    private static let placeTimeKey = "sportcam.watermark.placeTime"
+
+    private func cachedPlace() -> String? {
+        let store = UserDefaults.standard
+        let text = store.string(forKey: LocationProvider.placeKey) ?? ""
+        guard !text.isEmpty else { return nil }
+        let when = store.object(forKey: LocationProvider.placeTimeKey) as? Date ?? .distantPast
+        guard abs(when.timeIntervalSinceNow) < 6 * 3600 else { return nil }
+        return text
+    }
+
+    private func remember(_ text: String) {
+        let store = UserDefaults.standard
+        store.set(text, forKey: LocationProvider.placeKey)
+        store.set(Date(), forKey: LocationProvider.placeTimeKey)
     }
 
     func stop() {
@@ -99,10 +123,9 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         geocoder.cancelGeocode()
         geocoder.reverseGeocodeLocation(location) { [weak self] marks, _ in
             guard let self = self, let mark = marks?.first else { return }
-            // 拿到结果就把精度收回来，别一直高精度耗电
-            self.manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
             let text = LocationProvider.describe(mark)
             guard !text.isEmpty else { return }
+            self.remember(text)
             DispatchQueue.main.async { self.onPlace?(text) }
         }
     }

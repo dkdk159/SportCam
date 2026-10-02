@@ -109,6 +109,7 @@ private struct CircleIcon: View {
 /// 只有设置里打开「时间地点水印」才出现在画面上。
 private struct WatermarkPreview: View {
     let place: String
+    let bottomInset: CGFloat
     @State private var now = Date()
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -133,7 +134,7 @@ private struct WatermarkPreview: View {
         .cornerRadius(6)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
         .padding(.leading, 12)
-        .padding(.bottom, 148)
+        .padding(.bottom, bottomInset)
         .onReceive(tick) { now = $0 }
         .allowsHitTesting(false)
     }
@@ -271,7 +272,8 @@ struct CameraScreen: View {
 
             // 水印：开关打开才显示，位置对齐最终烧进视频的左下角
             if engine.watermarkOn {
-                WatermarkPreview(place: engine.watermarkPlace)
+                WatermarkPreview(place: engine.watermarkPlace,
+                                 bottomInset: engine.proControl != nil ? 300 : 148)
             }
 
             if let point = focusReticle {
@@ -289,6 +291,11 @@ struct CameraScreen: View {
                 if engine.showLevel {
                     LevelOverlay(sensor: engine.level)
                     Spacer().frame(height: 14)
+                }
+                // 参数面板贴在底栏上方：快门按钮始终露在外面
+                if let control = engine.proControl {
+                    proSheet(control)
+                        .transition(.move(edge: .bottom))
                 }
                 bottomBar
             }
@@ -352,14 +359,6 @@ struct CameraScreen: View {
                             }
                         }
                     )
-            }
-
-            if let control = engine.proControl {
-                VStack {
-                    Spacer()
-                    proSheet(control)
-                }
-                .transition(.move(edge: .bottom))
             }
 
             if showDuration && engine.proControl == nil { durationPicker }
@@ -560,11 +559,10 @@ struct CameraScreen: View {
         .buttonStyle(PlainButtonStyle())
     }
 
-    // MARK: 底部（变焦胶囊 / 功能图标行 / 快门行）
+    // MARK: 底部（变焦胶囊 / 快门行 + 参数按钮）
     private var bottomBar: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 14) {
             zoomPill
-            toolRow
             shutterRow
         }
         .padding(.bottom, 16)
@@ -592,37 +590,8 @@ struct CameraScreen: View {
         .clipShape(Capsule())
     }
 
-    private var toolRow: some View {
-        HStack(spacing: 0) {
-            ForEach(ProControl.allCases) { control in
-                toolItem(control.icon, control.rawValue, engine.proIsManual(control)) {
-                    engine.openPro(control)
-                }
-            }
-        }
-        .padding(.horizontal, 8)
-    }
-
-    private func toolItem(_ icon: String, _ title: String, _ active: Bool,
-                          _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundColor(active ? Palette.appleYellow : .white)
-                Text(title)
-                    .font(.system(size: 10))
-                    .foregroundColor(active ? Palette.appleYellow : .white.opacity(0.85))
-            }
-            .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(PlainButtonStyle())
-        .disabled(engine.isRecording)
-        .opacity(engine.isRecording ? 0.4 : 1)
-    }
-
     private var shutterRow: some View {
-        HStack {
+        HStack(spacing: 12) {
             Button {
                 engine.openPhotos()
             } label: {
@@ -638,6 +607,31 @@ struct CameraScreen: View {
                         RoundedRectangle(cornerRadius: 8, style: .continuous)
                             .stroke(Palette.border, lineWidth: 0.5)
                     )
+            }
+            .buttonStyle(PlainButtonStyle())
+
+            // 一个按钮管全部专业参数：点开面板，里面六项随便切
+            Button {
+                if engine.proControl == nil {
+                    engine.openPro(.exposure)
+                } else {
+                    engine.closePro()
+                }
+            } label: {
+                VStack(spacing: 2) {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 17, weight: .medium))
+                    Text("参数")
+                        .font(.system(size: 9))
+                }
+                .foregroundColor(engine.proControl != nil ? .black : .white)
+                .frame(width: 46, height: 46)
+                .background(engine.proControl != nil ? Color.white : Palette.glass)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Palette.border, lineWidth: 0.5)
+                )
             }
             .buttonStyle(PlainButtonStyle())
 
@@ -669,24 +663,44 @@ struct CameraScreen: View {
             // 单独的时间入口：点一下就能改预录时长
             CircleIcon(icon: "timer", diameter: 46) { showDuration = true }
         }
-        .padding(.horizontal, 34)
+        .padding(.horizontal, 20)
     }
 
-    // MARK: 专业参数面板（底部升起，参考 App 的滑杆）
+    // MARK: 专业参数面板（贴在底栏上方，六项在这里直接切换）
     private func proSheet(_ control: ProControl) -> some View {
         let rangeText = engine.proRangeText(control)
-        return VStack(spacing: 14) {
-            HStack {
-                Image(systemName: control.icon)
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundColor(.white)
-                Text(control.rawValue)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(.white)
-                Spacer()
+        return VStack(spacing: 12) {
+            // 六个功能全在面板里，点一下就换，不用先关掉再开
+            HStack(spacing: 6) {
+                ForEach(ProControl.allCases) { item in
+                    Button {
+                        engine.openPro(item)
+                    } label: {
+                        VStack(spacing: 3) {
+                            Image(systemName: item.icon)
+                                .font(.system(size: 15, weight: .medium))
+                            Text(item.rawValue)
+                                .font(.system(size: 9))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.7)
+                        }
+                        .foregroundColor(item == control
+                                         ? .black
+                                         : (engine.proIsManual(item) ? Palette.appleYellow : .white))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(item == control ? Color.white : Color.white.opacity(0.10))
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+            }
+
+            HStack(spacing: 10) {
                 Text(engine.proDisplay(control))
-                    .font(Palette.mono(14, .semibold))
+                    .font(Palette.mono(15, .semibold))
                     .foregroundColor(engine.proIsManual(control) ? Palette.appleYellow : .white.opacity(0.75))
+                Spacer()
                 Button {
                     engine.resetPro(control)
                 } label: {
@@ -721,9 +735,9 @@ struct CameraScreen: View {
             .font(Palette.mono(10))
             .foregroundColor(.white.opacity(0.5))
         }
-        .padding(.horizontal, 20)
-        .padding(.top, 16)
-        .padding(.bottom, 28)
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 12)
         .frame(maxWidth: .infinity)
         .background(
             Color(red: 0.13, green: 0.13, blue: 0.14)
