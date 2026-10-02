@@ -408,7 +408,8 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var preRecordDelay: PreRecordDelay = .s15 { didSet { if oldValue != preRecordDelay { syncPreRecord() } } }
     @Published var powerSave: PowerSaveDelay = .never { didSet { resetPowerTimer() } }
     @Published var showGrid = true
-    @Published var showLevel = true
+    /// 画面中间那个"圆圈十字架"水平仪，默认不显示（设置 → 拍摄辅助 里可以打开）
+    @Published var showLevel = false
     @Published var beepOn = true
     @Published var debugInfo = false
     /// 语音控制默认开启：装好即可直接说「开始录像」「停止录像」
@@ -419,6 +420,8 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var watermarkOn = false { didSet { if oldValue != watermarkOn { syncWatermark() } } }
     /// 当前地名（开启水印后由定位反查得到）
     @Published var watermarkPlace = ""
+    /// 定位异常提示（只在设置页显示，不会写进视频）
+    @Published var locationNote = ""
 
     let session = AVCaptureSession()
     let level = LevelSensor()
@@ -489,11 +492,12 @@ final class CameraEngine: NSObject, ObservableObject {
         locator.onPlace = { [weak self] text in
             guard let self = self, self.watermarkPlace != text else { return }
             self.watermarkPlace = text
+            self.locationNote = ""
             Log.write("[水印] 地点：\(text)")
         }
         locator.onFailure = { [weak self] reason in
-            guard let self = self else { return }
-            if self.watermarkPlace.isEmpty { self.watermarkPlace = reason }
+            // 只提示在设置页，绝不写进 watermarkPlace —— 否则"定位失败"会被烧进视频
+            self?.locationNote = reason
         }
 
         uiTimer?.invalidate()
@@ -1135,6 +1139,7 @@ final class CameraEngine: NSObject, ObservableObject {
         } else {
             locator.stop()
             watermarkPlace = ""
+            locationNote = ""
             Log.write("[水印] 关闭")
         }
     }

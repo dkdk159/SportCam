@@ -38,20 +38,33 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         super.init()
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
-        manager.distanceFilter = 100          // 走 100 米以上才重新上报
+        manager.distanceFilter = 25           // 走 25 米以上就重新上报，地名跟得上移动
     }
 
     func start() {
         guard !running else { return }
         running = true
+        // 先用高精度换"马上有结果"，拿到地名后再放宽省电
+        manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+        manager.distanceFilter = 25
         switch manager.authorizationStatus {
         case .notDetermined:
             manager.requestWhenInUseAuthorization()
         case .authorizedWhenInUse, .authorizedAlways:
-            manager.startUpdatingLocation()
+            begin()
         default:
             DispatchQueue.main.async { self.onFailure?("定位权限未开启") }
         }
+    }
+
+    /// 立刻用系统缓存的位置出一版地名，再持续更新。
+    /// 只调 startUpdatingLocation 的话要等系统慢慢吐出第一个点，开关打开后好几秒才有地名。
+    private func begin() {
+        manager.startUpdatingLocation()
+        if let cached = manager.location, abs(cached.timestamp.timeIntervalSinceNow) < 300 {
+            resolve(cached)
+        }
+        manager.requestLocation()          // 再要一次单次定位，拿更新的点
     }
 
     func stop() {
@@ -65,7 +78,7 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
     func locationManager(_ manager: CLLocationManager, didChangeAuthorization status: CLAuthorizationStatus) {
         guard running else { return }
         if status == .authorizedWhenInUse || status == .authorizedAlways {
-            manager.startUpdatingLocation()
+            begin()
         } else if status == .denied || status == .restricted {
             DispatchQueue.main.async { self.onFailure?("定位权限被拒绝") }
         }
@@ -75,15 +88,19 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         guard let location = locations.last else { return }
         // 反查地名有配额也很贵：位置基本没动、或刚查过，就跳过
         if let last = lastGeocodedLocation,
-           location.distance(from: last) < 80,
-           Date().timeIntervalSince(lastGeocodeAt) < 15 { return }
-        if Date().timeIntervalSince(lastGeocodeAt) < 3 { return }
+           location.distance(from: last) < 50,
+           Date().timeIntervalSince(lastGeocodeAt) < 8 { return }
+        resolve(location)
+    }
 
+    private func resolve(_ location: CLLocation) {
         lastGeocodeAt = Date()
         lastGeocodedLocation = location
         geocoder.cancelGeocode()
         geocoder.reverseGeocodeLocation(location) { [weak self] marks, _ in
             guard let self = self, let mark = marks?.first else { return }
+            // 拿到结果就把精度收回来，别一直高精度耗电
+            self.manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
             let text = LocationProvider.describe(mark)
             guard !text.isEmpty else { return }
             DispatchQueue.main.async { self.onPlace?(text) }

@@ -194,11 +194,10 @@ private struct RoundedCorner: Shape {
     }
 }
 
-/// 横向刻度滑杆：左右拖动改数值，黄色竖线表示当前位置
+/// 横向刻度滑杆：点哪儿就选哪儿，也可以按住不放继续微调
 private struct RulerSlider: View {
     let value: Double                 // 0...1
     let onChange: (Double) -> Void
-    @State private var dragStart: Double?
 
     var body: some View {
         GeometryReader { geo in
@@ -220,14 +219,14 @@ private struct RulerSlider: View {
             .frame(height: 40)
             .contentShape(Rectangle())
             .gesture(
-                DragGesture(minimumDistance: 1)
+                // minimumDistance: 0 —— 按下的瞬间就生效，点哪儿选哪儿；
+                // 手指不离开继续拖动就是微调。
+                DragGesture(minimumDistance: 0)
                     .onChanged { gesture in
-                        let base = dragStart ?? value
-                        if dragStart == nil { dragStart = base }
-                        let delta = Double(gesture.translation.width / (width - 16))
-                        onChange(min(max(base + delta, 0), 1))
+                        let usable = max(width - 16, 1)
+                        let t = Double((gesture.location.x - 8) / usable)
+                        onChange(min(max(t, 0), 1))
                     }
-                    .onEnded { _ in dragStart = nil }
             )
         }
         .frame(height: 40)
@@ -784,7 +783,9 @@ struct SettingsSheet: View {
                         HStack {
                             Text("当前地点")
                             Spacer()
-                            Text(engine.watermarkPlace.isEmpty ? "定位中…" : engine.watermarkPlace)
+                            Text(engine.watermarkPlace.isEmpty
+                                 ? (engine.locationNote.isEmpty ? "定位中…" : engine.locationNote)
+                                 : engine.watermarkPlace)
                                 .foregroundColor(.secondary)
                         }
                     }
