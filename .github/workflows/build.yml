@@ -1,0 +1,57 @@
+name: Build iOS App
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Select Xcode
+      run: |
+        XCODE_PATH=$(ls -d /Applications/Xcode*.app | head -1)
+        echo "Using $XCODE_PATH"
+        sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
+        xcodebuild -version
+
+    - name: Build for device (no signing)
+      run: |
+        set -o pipefail
+        xcodebuild \
+          -project SportCam.xcodeproj \
+          -target SportCam \
+          -configuration Debug \
+          -sdk iphoneos \
+          CODE_SIGN_IDENTITY="" \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO \
+          ONLY_ACTIVE_ARCH=NO \
+          build 2>&1 | tee build.log | tail -n 150
+
+    - name: Print compile errors
+      if: failure()
+      run: |
+        grep -n "error:" build.log | head -n 80 || true
+
+    - name: Package IPA
+      run: |
+        APP_PATH=$(find . -name "SportCam.app" -path "*Debug-iphoneos*" | head -1)
+        echo "App: $APP_PATH"
+        mkdir -p output/Payload
+        cp -R "$APP_PATH" output/Payload/
+        cd output
+        zip -q -r SportCam.ipa Payload
+        cd ..
+        ls -la output
+
+    - name: Upload IPA
+      uses: actions/upload-artifact@v4
+      with:
+        name: SportCam-IPA
+        path: output/SportCam.ipa
+        if-no-files-found: error
