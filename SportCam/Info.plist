@@ -44,17 +44,17 @@
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>需要使用相机进行录像拍摄</string>
+	<string>用于取景拍摄和录制视频</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>需要使用麦克风录制视频声音和使用语音控制</string>
+	<string>录制视频时同步录下现场声音，也用于识别语音口令</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>需要把录制的视频保存到相册</string>
+	<string>把拍好的视频保存到你的相册</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>需要访问相册以查看录制的视频</string>
+	<string>浏览和播放你拍摄的视频</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>需要使用语音识别实现「开始录像」等语音控制</string>
+	<string>识别「开始录像」「停止录像」等口令，方便免手操作</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>开启「时间地点水印」后，需要用定位获取当前位置并写进视频画面</string>
+	<string>开启时间地点水印后，读取当前位置并写入画面</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

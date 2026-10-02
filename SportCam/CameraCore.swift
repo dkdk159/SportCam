@@ -412,6 +412,10 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var showGrid = true
     /// 画面中间那个"圆圈十字架"水平仪，默认不显示（设置 → 拍摄辅助 里可以打开）
     @Published var showLevel = false
+    /// 降噪：音频风噪抑制 + 画面暗光降噪，哪个系统支持就开哪个
+    @Published var denoiseOn = false { didSet { if oldValue != denoiseOn { applyDenoise() } } }
+    /// 降噪实际生效情况（设置页显示用）
+    @Published var denoiseNote = ""
     @Published var beepOn = true
     @Published var debugInfo = false
     /// 语音控制默认开启：装好即可直接说「开始录像」「停止录像」
@@ -454,6 +458,7 @@ final class CameraEngine: NSObject, ObservableObject {
         set { deviceRefLock.lock(); defer { deviceRefLock.unlock() }; storedCameraDevice = newValue }
     }
     private var cameraInput: AVCaptureDeviceInput?
+    private var audioInput: AVCaptureDeviceInput?
     private var deliveredSize = CGSize.zero
     private var needEncoderRebuild = false
     private var lastKeyTime = CMTime.invalid
@@ -587,9 +592,9 @@ final class CameraEngine: NSObject, ObservableObject {
                                          options: [.defaultToSpeaker, .allowBluetooth])
             try audioSession.setActive(true)
             if audioSession.sampleRate > 0 {
-                Log.write("[音频] 会话就绪 \(Int(audioSession.sampleRate))Hz 模式=videoRecording")
+                Log.write("[音频] 录音就绪 \(Int(audioSession.sampleRate))Hz")
             } else {
-                Log.write("[音频] 会话就绪 模式=videoRecording")
+                Log.write("[音频] 录音就绪")
             }
         } catch {
             Log.write("[音频] 会话失败 \(error.localizedDescription)")
@@ -610,10 +615,11 @@ final class CameraEngine: NSObject, ObservableObject {
             cameraDevice = device
             cameraInput = input
         }
-        if let microphone = AVCaptureDevice.default(for: .audio),
-           let input = try? AVCaptureDeviceInput(device: microphone),
+        if let mic = AVCaptureDevice.default(for: .audio),
+           let input = try? AVCaptureDeviceInput(device: mic),
            session.canAddInput(input) {
             session.addInput(input)
+            audioInput = input
         }
 
         videoOutput.alwaysDiscardsLateVideoFrames = true
@@ -627,6 +633,7 @@ final class CameraEngine: NSObject, ObservableObject {
         session.commitConfiguration()
         attachConnectionsLocked()
         applyFrameRateLocked()
+        applyDenoiseLocked()
         session.startRunning()
         attachConnectionsLocked()
         Log.write("[会话] 启动 \(quality.rawValue) \(frameRate.rawValue)fps \(fieldOfView.rawValue)")
@@ -683,6 +690,7 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.focusLensPosition = -1
             }
             Log.write("[镜头] 翻转 → \(next == .front ? "前置" : "后置")")
+            self.applyDenoiseLocked()          // 新摄像头的暗光降噪也要贴上去
         }
     }
 
@@ -1158,6 +1166,44 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
+    // MARK: 降噪
+    private func applyDenoise() {
+        sessionQueue.async { [weak self] in self?.applyDenoiseLocked() }
+    }
+
+    /// 音频走系统的风噪抑制（iOS 17+ 才开放），画面走低光增强抑制暗部噪点。
+    /// 两者都不支持的话就在设置页说明白，不做假开关。
+    private func applyDenoiseLocked() {
+        let on = denoiseOn
+        var audioOK = false
+        var videoOK = false
+
+        if let input = audioInput {
+            // 风噪抑制挂在 AVCaptureDeviceInput 上，而且要 iOS 18 才开放
+            if #available(iOS 18.0, *), input.isWindNoiseRemovalSupported {
+                input.isWindNoiseRemovalEnabled = on
+                audioOK = true
+            }
+        }
+
+        if let device = cameraDevice, device.isLowLightBoostSupported {
+            do {
+                try device.lockForConfiguration()
+                device.automaticallyEnablesLowLightBoostWhenAvailable = on
+                device.unlockForConfiguration()
+                videoOK = true
+            } catch {
+                Log.write("[降噪] 画面设置失败 \(error.localizedDescription)")
+            }
+        }
+
+        var parts: [String] = []
+        parts.append(audioOK ? "麦克风风噪抑制" : "本机不支持麦克风风噪抑制")
+        parts.append(videoOK ? "暗光画面降噪" : "本机不支持暗光画面降噪")
+        let note = parts.joined(separator: " · ")
+        DispatchQueue.main.async { self.denoiseNote = on ? note : "" }
+    }
+
     // MARK: 预录
     private func syncPreRecord() {
         preRecordSeconds = 0
@@ -1258,7 +1304,7 @@ final class CameraEngine: NSObject, ObservableObject {
                 guard ok else {
                     DispatchQueue.main.async {
                         self.isBusy = false
-                        self.message("合并失败，请看日志")
+                        self.message("保存失败，请重试")
                     }
                     return
                 }
@@ -1414,10 +1460,8 @@ final class CameraEngine: NSObject, ObservableObject {
     func message(_ text: String) {
         DispatchQueue.main.async {
             self.toast = text
-            if text.contains("失败") || text.contains("没有录到") {
-                self.showLog = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.showLog = false }
-            }
+            // 以前出错会把调试日志糊在屏幕上一段时间，正式版里不做了
+            Log.write("[提示] \(text)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                 if self?.toast == text { self?.toast = nil }
             }

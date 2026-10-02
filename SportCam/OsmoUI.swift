@@ -396,10 +396,11 @@ struct CameraScreen: View {
             VStack(alignment: .trailing, spacing: 8) {
                 HStack(spacing: 8) {
                     if engine.voiceListening {
-                        Text("🎙")
-                            .font(.system(size: 11))
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(Palette.accent)
                             .padding(.horizontal, 9)
-                            .padding(.vertical, 5)
+                            .padding(.vertical, 7)
                             .background(Palette.glass)
                             .clipShape(Capsule())
                     }
@@ -418,6 +419,14 @@ struct CameraScreen: View {
                                diameter: 38) {
                         engine.toggleTorch()
                     }
+                    // 翻转：前/后摄像头切换。原来藏在设置里，挪到屏幕上单手就能切
+                    CircleIcon(icon: "arrow.triangle.2.circlepath.camera",
+                               active: engine.cameraPosition == .front,
+                               diameter: 38) {
+                        engine.toggleCamera()
+                    }
+                    .disabled(engine.isRecording)
+                    .opacity(engine.isRecording ? 0.4 : 1)
                     CircleIcon(icon: "gearshape.fill", diameter: 38) { showSettings = true }
                 }
             }
@@ -456,8 +465,9 @@ struct CameraScreen: View {
             .clipShape(Capsule())
             .padding(.top, 10)
         } else {
+            // 这里是"预录快捷键"：点一下直接开关预录；预录时长在右下角的计时器按钮里设
             Button {
-                showDuration = true
+                engine.preRecordOn.toggle()
             } label: {
                 HStack(spacing: 9) {
                     ZStack {
@@ -501,7 +511,7 @@ struct CameraScreen: View {
         return min(max(CGFloat(engine.preRecordSeconds) / CGFloat(window), 0), 1)
     }
 
-    // MARK: 设置预录时长（点预录胶囊 / 点右下角时间按钮都会弹这个）
+    // MARK: 设置预录时长（右下角计时器按钮）
     private var durationPicker: some View {
         ZStack {
             Color.black.opacity(0.45)
@@ -590,43 +600,23 @@ struct CameraScreen: View {
     }
 
     private var shutterRow: some View {
-        HStack(spacing: 12) {
-            Button {
+        HStack(spacing: 14) {
+            // 一行都是同样大小的圆形图标按钮：和顶栏保持一致，也更像系统相机
+            CircleIcon(icon: "photo.on.rectangle", diameter: 46) {
                 engine.openPhotos()
-            } label: {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Palette.glass)
-                    .frame(width: 46, height: 46)
-                    .overlay(
-                        Image(systemName: "photo.on.rectangle")
-                            .font(.system(size: 18))
-                            .foregroundColor(.white)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .stroke(Palette.border, lineWidth: 0.5)
-                    )
             }
-            .buttonStyle(PlainButtonStyle())
 
             // 一个按钮管全部专业参数：点开面板，里面几项随便切
             Button {
                 setPro(engine.proControl == nil ? .exposure : nil)
             } label: {
-                VStack(spacing: 2) {
-                    Image(systemName: "slider.horizontal.3")
-                        .font(.system(size: 17, weight: .medium))
-                    Text("参数")
-                        .font(.system(size: 9))
-                }
-                .foregroundColor(engine.proControl != nil ? .black : .white)
-                .frame(width: 46, height: 46)
-                .background(engine.proControl != nil ? Color.white : Palette.glass)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Palette.border, lineWidth: 0.5)
-                )
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(engine.proControl != nil ? .black : .white)
+                    .frame(width: 46, height: 46)
+                    .background(engine.proControl != nil ? Color.white : Palette.glass)
+                    .clipShape(Circle())
+                    .overlay(Circle().stroke(Palette.border, lineWidth: 0.5))
             }
             .buttonStyle(PlainButtonStyle())
 
@@ -655,7 +645,7 @@ struct CameraScreen: View {
 
             Spacer()
 
-            // 单独的时间入口：点一下就能改预录时长
+            // 预录时长入口：点一下就能改（预录开关在顶部胶囊上点）
             CircleIcon(icon: "timer", diameter: 46) { showDuration = true }
         }
         .padding(.horizontal, 20)
@@ -810,15 +800,16 @@ struct SettingsSheet: View {
                     Picker("视角", selection: $engine.fieldOfView) {
                         ForEach(FieldOfView.allCases) { Text($0.rawValue).tag($0) }
                     }.disabled(engine.isRecording || engine.cameraPosition == .front)
-                    Toggle("前置摄像头", isOn: Binding(
-                        get: { engine.cameraPosition == .front },
-                        set: { want in
-                            if want != (engine.cameraPosition == .front) { engine.toggleCamera() }
-                        }
-                    )).disabled(engine.isRecording)
                     Picker("防抖", selection: $engine.antiShake) {
                         ForEach(AntiShake.allCases) { Text($0.rawValue).tag($0) }
                     }.disabled(engine.isRecording)
+                }
+
+                Section(header: Text("降噪"),
+                        footer: Text(engine.denoiseOn && !engine.denoiseNote.isEmpty
+                                     ? "已生效：\(engine.denoiseNote)"
+                                     : "开启后抑制麦克风风噪，并在暗光下压制画面噪点。是否可用取决于机型和系统版本。")) {
+                    Toggle("降噪", isOn: $engine.denoiseOn)
                 }
 
                 Section(header: Text("水印"),
@@ -883,10 +874,6 @@ struct SettingsSheet: View {
                     Toggle("构图网格", isOn: $engine.showGrid)
                     Toggle("水平仪", isOn: $engine.showLevel)
                     Toggle("录制提示音", isOn: $engine.beepOn)
-                }
-
-                Section(header: Text("其它")) {
-                    Toggle("显示调试信息", isOn: $engine.debugInfo)
                 }
             }
             .navigationBarTitle("设置", displayMode: .inline)
