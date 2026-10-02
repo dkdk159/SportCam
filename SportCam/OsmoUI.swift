@@ -27,6 +27,8 @@ private final class PreviewHost: UIView {
 private struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     let orientation: AVCaptureVideoOrientation
+    /// 前置摄像头时预览要镜像（录制出来的画面仍是非镜像）
+    let mirrored: Bool
     /// 音量键 / iPhone 16 相机按钮：按一下切换录制
     let onCaptureButton: () -> Void
 
@@ -50,7 +52,7 @@ private struct CameraPreview: UIViewRepresentable {
         if connection.isVideoOrientationSupported { connection.videoOrientation = orientation }
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = false
+            connection.isVideoMirrored = mirrored
         }
     }
 }
@@ -119,6 +121,59 @@ private struct LevelOverlay: View {
     }
 }
 
+/// 只有部分角是圆角
+private struct RoundedCorner: Shape {
+    var radius: CGFloat
+    var corners: UIRectCorner
+
+    func path(in rect: CGRect) -> Path {
+        let path = UIBezierPath(roundedRect: rect,
+                                byRoundingCorners: corners,
+                                cornerRadii: CGSize(width: radius, height: radius))
+        return Path(path.cgPath)
+    }
+}
+
+/// 横向刻度滑杆：左右拖动改数值，黄色竖线表示当前位置
+private struct RulerSlider: View {
+    let value: Double                 // 0...1
+    let onChange: (Double) -> Void
+    @State private var dragStart: Double?
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = max(geo.size.width, 1)
+            ZStack {
+                HStack(spacing: 0) {
+                    ForEach(0..<40, id: \.self) { index in
+                        Rectangle()
+                            .fill(index % 5 == 0 ? Color.white.opacity(0.5) : Color.white.opacity(0.18))
+                            .frame(width: 1, height: index % 5 == 0 ? 18 : 10)
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                Rectangle()
+                    .fill(Palette.appleYellow)
+                    .frame(width: 2, height: 28)
+                    .offset(x: CGFloat(value - 0.5) * (width - 16))
+            }
+            .frame(height: 40)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { gesture in
+                        let base = dragStart ?? value
+                        if dragStart == nil { dragStart = base }
+                        let delta = Double(gesture.translation.width / (width - 16))
+                        onChange(min(max(base + delta, 0), 1))
+                    }
+                    .onEnded { _ in dragStart = nil }
+            )
+        }
+        .frame(height: 40)
+    }
+}
+
 // MARK: - 主界面
 struct CameraScreen: View {
     @ObservedObject var engine: CameraEngine
@@ -133,6 +188,7 @@ struct CameraScreen: View {
 
             CameraPreview(session: engine.session,
                           orientation: engine.videoOrientation,
+                          mirrored: engine.cameraPosition == .front,
                           onCaptureButton: { engine.toggleRecording() })
                 .ignoresSafeArea()
                 .gesture(
@@ -218,7 +274,15 @@ struct CameraScreen: View {
                     )
             }
 
-            if showDuration { durationPicker }
+            if let control = engine.proControl {
+                VStack {
+                    Spacer()
+                    proSheet(control)
+                }
+                .transition(.move(edge: .bottom))
+            }
+
+            if showDuration && engine.proControl == nil { durationPicker }
         }
         .onAppear { engine.launch() }
         .statusBar(hidden: true)
@@ -447,11 +511,11 @@ struct CameraScreen: View {
 
     private var toolRow: some View {
         HStack(spacing: 0) {
-            toolItem("grid", "网格", engine.showGrid) { engine.showGrid.toggle() }
-            toolItem("circle.dashed", "水平仪", engine.showLevel) { engine.showLevel.toggle() }
-            toolItem("camera.filters", "防抖", engine.antiShake != .off) { cycleAntiShake() }
-            toolItem("arrow.triangle.2.circlepath.camera", "镜头", false) { cycleLens() }
-            toolItem("speaker.wave.2.fill", "提示音", engine.beepOn) { engine.beepOn.toggle() }
+            toolItem("sun.max.fill", "曝光", engine.proIsManual(.exposure)) { engine.openPro(.exposure) }
+            toolItem("camera.aperture", "ISO", engine.proIsManual(.iso)) { engine.openPro(.iso) }
+            toolItem("timer", "快门", engine.proIsManual(.shutter)) { engine.openPro(.shutter) }
+            toolItem("thermometer.medium", "白平衡", engine.proIsManual(.whiteBalance)) { engine.openPro(.whiteBalance) }
+            toolItem("arrow.triangle.2.circlepath.camera", "翻转", engine.cameraPosition == .front) { engine.toggleCamera() }
             toolItem("gearshape.fill", "设置", false) { showSettings = true }
         }
         .padding(.horizontal, 8)
@@ -526,18 +590,63 @@ struct CameraScreen: View {
         .padding(.horizontal, 34)
     }
 
-    private func cycleAntiShake() {
-        let order: [AntiShake] = [.off, .standard, .cinematic, .auto]
-        if let index = order.firstIndex(of: engine.antiShake) {
-            engine.antiShake = order[(index + 1) % order.count]
-        }
-    }
+    // MARK: 专业参数面板（底部升起，参考 App 的滑杆）
+    private func proSheet(_ control: ProControl) -> some View {
+        let rangeText = engine.proRangeText(control)
+        return VStack(spacing: 14) {
+            HStack {
+                Image(systemName: control.icon)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(.white)
+                Text(control.rawValue)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.white)
+                Spacer()
+                Text(engine.proDisplay(control))
+                    .font(Palette.mono(14, .semibold))
+                    .foregroundColor(engine.proIsManual(control) ? Palette.appleYellow : .white.opacity(0.75))
+                Button {
+                    engine.resetPro(control)
+                } label: {
+                    Text("A")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(engine.proIsManual(control) ? .white : .black)
+                        .frame(width: 30, height: 30)
+                        .background(engine.proIsManual(control) ? Color.white.opacity(0.15) : Color.white)
+                        .clipShape(Circle())
+                }
+                .buttonStyle(PlainButtonStyle())
+                Button {
+                    engine.closePro()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.8))
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
 
-    private func cycleLens() {
-        let order: [FieldOfView] = [.ultraWide, .wide, .telephoto]
-        if let index = order.firstIndex(of: engine.fieldOfView) {
-            engine.fieldOfView = order[(index + 1) % order.count]
+            RulerSlider(value: engine.proNormalized(control)) { t in
+                engine.setPro(control, normalized: t)
+            }
+
+            HStack {
+                Text(rangeText.0)
+                Spacer()
+                Text(rangeText.1)
+            }
+            .font(Palette.mono(10))
+            .foregroundColor(.white.opacity(0.5))
         }
+        .padding(.horizontal, 20)
+        .padding(.top, 16)
+        .padding(.bottom, 28)
+        .frame(maxWidth: .infinity)
+        .background(
+            Color(red: 0.13, green: 0.13, blue: 0.14)
+                .clipShape(RoundedCorner(radius: 18, corners: [.topLeft, .topRight]))
+        )
     }
 
     private func zoomSelected(_ chip: String) -> Bool {

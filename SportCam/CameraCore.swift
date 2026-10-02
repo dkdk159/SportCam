@@ -71,6 +71,23 @@ enum AntiShake: String, CaseIterable, Identifiable {
     }
 }
 
+/// 专业参数（底部滑杆面板）
+enum ProControl: String, CaseIterable, Identifiable {
+    case exposure = "曝光"
+    case iso = "ISO"
+    case shutter = "快门"
+    case whiteBalance = "白平衡"
+    var id: String { rawValue }
+    var icon: String {
+        switch self {
+        case .exposure: return "sun.max.fill"
+        case .iso: return "camera.aperture"
+        case .shutter: return "timer"
+        case .whiteBalance: return "thermometer.medium"
+        }
+    }
+}
+
 /// 预录时长（按下之前保留多久的画面）
 enum PreRecordDelay: Int, CaseIterable, Identifiable {
     case s5 = 5
@@ -374,6 +391,14 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var frameRate: FrameRate = .fps30 { didSet { if oldValue != frameRate { applyFrameRate() } } }
     @Published var antiShake: AntiShake = .standard { didSet { if oldValue != antiShake { attachConnections() } } }
     @Published var zoom: CGFloat = 1.0 { didSet { if oldValue != zoom { applyZoom() } } }
+    // 专业参数：0 表示自动
+    @Published var cameraPosition: AVCaptureDevice.Position = .back
+    @Published var proControl: ProControl?          // 非空时弹出底部滑杆面板
+    @Published var exposureBias: Float = 0          // EV
+    @Published var isoValue: Float = 0              // 0 = 自动
+    @Published var shutterSeconds: Double = 0       // 0 = 自动
+    @Published var whiteBalanceKelvin: Float = 0    // 0 = 自动
+
     @Published var preRecordOn = false { didSet { if oldValue != preRecordOn { syncPreRecord() } } }
     @Published var preRecordDelay: PreRecordDelay = .s15 { didSet { if oldValue != preRecordDelay { syncPreRecord() } } }
     @Published var powerSave: PowerSaveDelay = .never { didSet { resetPowerTimer() } }
@@ -529,7 +554,7 @@ final class CameraEngine: NSObject, ObservableObject {
         session.beginConfiguration()
         if session.canSetSessionPreset(quality.preset) { session.sessionPreset = quality.preset }
 
-        if let device = camera(for: fieldOfView),
+        if let device = camera(cameraPosition, fieldOfView: fieldOfView),
            let input = try? AVCaptureDeviceInput(device: device),
            session.canAddInput(input) {
             session.addInput(input)
@@ -558,9 +583,57 @@ final class CameraEngine: NSObject, ObservableObject {
         Log.write("[会话] 启动 \(quality.rawValue) \(frameRate.rawValue)fps \(fieldOfView.rawValue)")
     }
 
-    private func camera(for fov: FieldOfView) -> AVCaptureDevice? {
-        AVCaptureDevice.default(fov.lens, for: .video, position: .back)
+    private func camera(_ position: AVCaptureDevice.Position, fieldOfView fov: FieldOfView) -> AVCaptureDevice? {
+        if position == .front {
+            return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
+        }
+        return AVCaptureDevice.default(fov.lens, for: .video, position: .back)
             ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+    }
+
+    /// 前后摄像头翻转
+    func toggleCamera() {
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            if self.recording {
+                Log.write("[镜头] 录制中不可翻转")
+                return
+            }
+            let next: AVCaptureDevice.Position = self.cameraPosition == .back ? .front : .back
+            guard let device = self.camera(next, fieldOfView: self.fieldOfView),
+                  let input = try? AVCaptureDeviceInput(device: device) else {
+                DispatchQueue.main.async { self.message("该机型不支持翻转") }
+                return
+            }
+            let old = self.cameraInput
+            self.session.beginConfiguration()
+            if let old = old { self.session.removeInput(old) }
+            guard self.session.canAddInput(input) else {
+                if let old = old { self.session.addInput(old) }
+                self.session.commitConfiguration()
+                return
+            }
+            self.session.addInput(input)
+            self.cameraInput = input
+            self.cameraDevice = device
+            self.session.commitConfiguration()
+            self.attachConnectionsLocked()
+            self.applyFrameRateLocked()
+            self.encoder.invalidate()
+            self.needEncoderRebuild = true
+            // 换了摄像头：分段格式已不一致，旧段全部作废
+            self.recorder.reset()
+            self.rearmPreRecord()
+            DispatchQueue.main.async {
+                self.cameraPosition = next
+                self.zoom = 1.0
+                self.exposureBias = 0
+                self.isoValue = 0
+                self.shutterSeconds = 0
+                self.whiteBalanceKelvin = 0
+            }
+            Log.write("[镜头] 翻转 → \(next == .front ? "前置" : "后置")")
+        }
     }
 
     /// 重新挂好输出连接。
@@ -616,7 +689,11 @@ final class CameraEngine: NSObject, ObservableObject {
                 Log.write("[镜头] 录制中不可切换")
                 return
             }
-            guard let device = self.camera(for: self.fieldOfView),
+            guard self.cameraPosition == .back else {
+                Log.write("[镜头] 前置摄像头不支持切换焦段")
+                return
+            }
+            guard let device = self.camera(.back, fieldOfView: self.fieldOfView),
                   let input = try? AVCaptureDeviceInput(device: device) else { return }
             self.session.beginConfiguration()
             if let old = self.cameraInput { self.session.removeInput(old) }
@@ -635,7 +712,13 @@ final class CameraEngine: NSObject, ObservableObject {
             // 换了镜头：分段格式已不一致，旧段全部作废
             self.recorder.reset()
             self.rearmPreRecord()
-            DispatchQueue.main.async { self.zoom = 1.0 }
+            DispatchQueue.main.async {
+                self.zoom = 1.0
+                self.exposureBias = 0
+                self.isoValue = 0
+                self.shutterSeconds = 0
+                self.whiteBalanceKelvin = 0
+            }
             Log.write("[镜头] \(self.fieldOfView.rawValue)")
         }
     }
@@ -685,6 +768,196 @@ final class CameraEngine: NSObject, ObservableObject {
         default:
             if fieldOfView != .wide { fieldOfView = .wide }
             zoom = 2.0
+        }
+    }
+
+    // MARK: 专业参数（曝光 / ISO / 快门 / 白平衡）
+    func openPro(_ control: ProControl) { proControl = control }
+    func closePro() { proControl = nil }
+
+    /// 该参数是否已从自动切到手动
+    func proIsManual(_ control: ProControl) -> Bool {
+        switch control {
+        case .exposure: return abs(exposureBias) > 0.01
+        case .iso: return isoValue > 0
+        case .shutter: return shutterSeconds > 0
+        case .whiteBalance: return whiteBalanceKelvin > 0
+        }
+    }
+
+    /// 可调范围（跟着当前摄像头/格式走）
+    func proRange(_ control: ProControl) -> ClosedRange<Double> {
+        guard let device = cameraDevice else { return 0...1 }
+        let format = device.activeFormat
+        switch control {
+        case .exposure:
+            let lo = Double(device.minExposureTargetBias)
+            let hi = Double(device.maxExposureTargetBias)
+            return lo < hi ? lo...hi : -2...2
+        case .iso:
+            let lo = Double(format.minISO), hi = Double(format.maxISO)
+            return lo < hi ? lo...hi : 24...3200
+        case .shutter:
+            let lo = CMTimeGetSeconds(format.minExposureDuration)
+            let hi = CMTimeGetSeconds(format.maxExposureDuration)
+            return lo > 0 && hi > lo ? lo...hi : (1.0 / 8000.0)...(1.0 / 2.0)
+        case .whiteBalance:
+            return 2500...9000
+        }
+    }
+
+    /// 当前生效值：自动时取设备当前值，滑杆就停在自动的位置上
+    func proEffective(_ control: ProControl) -> Double {
+        guard let device = cameraDevice else { return 0 }
+        switch control {
+        case .exposure:
+            return Double(exposureBias)
+        case .iso:
+            return isoValue > 0 ? Double(isoValue) : Double(device.iso)
+        case .shutter:
+            return shutterSeconds > 0 ? shutterSeconds : CMTimeGetSeconds(device.exposureDuration)
+        case .whiteBalance:
+            if whiteBalanceKelvin > 0 { return Double(whiteBalanceKelvin) }
+            return Double(device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains).temperature)
+        }
+    }
+
+    /// 换算成 0...1 的滑杆位置（ISO / 快门用对数刻度）
+    func proNormalized(_ control: ProControl) -> Double {
+        let range = proRange(control)
+        let value = proEffective(control)
+        switch control {
+        case .exposure, .whiteBalance:
+            guard range.upperBound > range.lowerBound else { return 0.5 }
+            return min(max((value - range.lowerBound) / (range.upperBound - range.lowerBound), 0), 1)
+        case .iso, .shutter:
+            guard range.lowerBound > 0, range.upperBound > range.lowerBound, value > 0 else { return 0 }
+            let t = (log(value) - log(range.lowerBound)) / (log(range.upperBound) - log(range.lowerBound))
+            return min(max(t, 0), 1)
+        }
+    }
+
+    func proDisplay(_ control: ProControl) -> String {
+        switch control {
+        case .exposure:
+            return proIsManual(.exposure) ? String(format: "%+.1f EV", exposureBias) : "自动"
+        case .iso:
+            return isoValue > 0 ? "ISO \(Int(isoValue))" : "自动"
+        case .shutter:
+            guard shutterSeconds > 0 else { return "自动" }
+            return shutterText(shutterSeconds)
+        case .whiteBalance:
+            return whiteBalanceKelvin > 0 ? "\(Int(whiteBalanceKelvin))K" : "自动"
+        }
+    }
+
+    func proRangeText(_ control: ProControl) -> (String, String) {
+        let range = proRange(control)
+        switch control {
+        case .exposure:
+            return (String(format: "%.0f", range.lowerBound), String(format: "%.0f", range.upperBound))
+        case .iso:
+            return ("\(Int(range.lowerBound))", "\(Int(range.upperBound))")
+        case .shutter:
+            return (shutterText(range.lowerBound), shutterText(range.upperBound))
+        case .whiteBalance:
+            return ("2500K", "9000K")
+        }
+    }
+
+    private func shutterText(_ seconds: Double) -> String {
+        if seconds >= 1 { return String(format: "%.0f\"", seconds) }
+        return "1/\(Int((1.0 / seconds).rounded()))"
+    }
+
+    func setPro(_ control: ProControl, normalized t: Double) {
+        let clamped = min(max(t, 0), 1)
+        let range = proRange(control)
+        switch control {
+        case .exposure:
+            exposureBias = Float(range.lowerBound + clamped * (range.upperBound - range.lowerBound))
+        case .iso:
+            isoValue = Float(logValue(range.lowerBound, range.upperBound, clamped))
+        case .shutter:
+            shutterSeconds = logValue(range.lowerBound, range.upperBound, clamped)
+        case .whiteBalance:
+            whiteBalanceKelvin = Float(range.lowerBound + clamped * (range.upperBound - range.lowerBound))
+        }
+        applyPro(control)
+    }
+
+    func resetPro(_ control: ProControl) {
+        switch control {
+        case .exposure: exposureBias = 0
+        case .iso: isoValue = 0
+        case .shutter: shutterSeconds = 0
+        case .whiteBalance: whiteBalanceKelvin = 0
+        }
+        applyPro(control)
+    }
+
+    private func logValue(_ lo: Double, _ hi: Double, _ t: Double) -> Double {
+        guard lo > 0, hi > lo else { return lo + (hi - lo) * t }
+        return exp(log(lo) + t * (log(hi) - log(lo)))
+    }
+
+    private func applyPro(_ control: ProControl) {
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            if control == .whiteBalance {
+                self.applyWhiteBalanceLocked()
+            } else {
+                self.applyExposureLocked()
+            }
+        }
+    }
+
+    private func applyExposureLocked() {
+        guard let device = cameraDevice else { return }
+        let format = device.activeFormat
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if isoValue > 0 || shutterSeconds > 0 {
+                var duration = device.exposureDuration
+                if shutterSeconds > 0 {
+                    let lo = CMTimeGetSeconds(format.minExposureDuration)
+                    let hi = CMTimeGetSeconds(format.maxExposureDuration)
+                    duration = CMTime(seconds: min(max(shutterSeconds, lo), hi), preferredTimescale: 1_000_000)
+                }
+                let iso = isoValue > 0 ? min(max(isoValue, format.minISO), format.maxISO) : device.iso
+                if device.isExposureModeSupported(.custom) {
+                    device.setExposureModeCustom(duration: duration, iso: iso, completionHandler: nil)
+                }
+            } else if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+                device.setExposureTargetBias(exposureBias, completionHandler: nil)
+            }
+        } catch {
+            Log.write("[专业] 曝光失败 \(error.localizedDescription)")
+        }
+    }
+
+    private func applyWhiteBalanceLocked() {
+        guard let device = cameraDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if whiteBalanceKelvin <= 0 {
+                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                    device.whiteBalanceMode = .continuousAutoWhiteBalance
+                }
+            } else if device.isWhiteBalanceModeSupported(.locked) {
+                let temp = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: whiteBalanceKelvin, tint: 0)
+                var gains = device.deviceWhiteBalanceGains(for: temp)
+                let maxGain = device.maxWhiteBalanceGain
+                gains.redGain = min(max(gains.redGain, 1), maxGain)
+                gains.greenGain = min(max(gains.greenGain, 1), maxGain)
+                gains.blueGain = min(max(gains.blueGain, 1), maxGain)
+                device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+            }
+        } catch {
+            Log.write("[专业] 白平衡失败 \(error.localizedDescription)")
         }
     }
 
