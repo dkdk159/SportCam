@@ -543,10 +543,18 @@ final class CameraEngine: NSObject, ObservableObject {
     private func configureAudioSession() {
         let audioSession = AVAudioSession.sharedInstance()
         do {
-            try audioSession.setCategory(.playAndRecord, mode: .default,
-                                         options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+            // 关键：录像必须用 .videoRecording 模式。
+            // .default 模式会给麦克风套上"语音通话"那套自动增益/降噪处理，
+            // 录出来的声音会一阵一阵发闷、发爆（就是听到的"滋滋/爆音"）。
+            // 参考 App 用的正是 PlayAndRecord + VideoRecording 这一组。
+            try audioSession.setCategory(.playAndRecord, mode: .videoRecording,
+                                         options: [.defaultToSpeaker, .allowBluetooth])
             try audioSession.setActive(true)
-            Log.write("[音频] 会话就绪")
+            if audioSession.sampleRate > 0 {
+                Log.write("[音频] 会话就绪 \(Int(audioSession.sampleRate))Hz 模式=videoRecording")
+            } else {
+                Log.write("[音频] 会话就绪 模式=videoRecording")
+            }
         } catch {
             Log.write("[音频] 会话失败 \(error.localizedDescription)")
         }

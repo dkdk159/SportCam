@@ -180,7 +180,10 @@ final class SoundPlayer {
     private static func makeTone(_ pattern: [(Double, Double)]) -> Data {
         let sampleRate = 44100
         let frequency = 880.0
-        let amplitude = 28000.0
+        // 提示音是外放喇叭放出来的，麦克风就在旁边。
+        // 原来 28000（约满量程 85%），录进视频里会直接把话筒推爆 → "爆音/吱吱"。
+        // 降到 11000（约 34%）既能听清，又不会录成爆音。
+        let amplitude = 11000.0
         let total = Int(0.7 * Double(sampleRate))
         var samples = [Int16](repeating: 0, count: total)
 
@@ -392,11 +395,21 @@ final class SegmentRecorder {
         guard let w = trackWriter, let input = trackInput, w.status == .writing else { return }
         let time = presentationTime(sample)
         if lastTrackPTS.isValid && CMTimeCompare(time, lastTrackPTS) <= 0 { return }
-        guard input.isReadyForMoreMediaData else { return }
-        if input.append(sample) {
+        if appendAudioWaiting(sample, to: input) {
             if !trackAnchor.isValid { trackAnchor = time }
             lastTrackPTS = time
         }
+    }
+
+    /// 音频宁可等一小会儿也不能丢帧：丢一帧就是波形上一个断点，听感就是"滋"一声。
+    /// 这里跑在录音器自己的串行队列上，短暂等待不会拖住采集线程。
+    private func appendAudioWaiting(_ sample: CMSampleBuffer, to input: AVAssetWriterInput) -> Bool {
+        var spins = 0
+        while !input.isReadyForMoreMediaData && spins < 25 {   // 最多等 50ms
+            Thread.sleep(forTimeInterval: 0.002)
+            spins += 1
+        }
+        return input.append(sample)
     }
 
     /// 用当前音频格式新开一条连续音轨（整个预录/录制期间只有这一条）
