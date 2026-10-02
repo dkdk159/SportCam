@@ -358,6 +358,19 @@ struct CameraScreen: View {
                         .onEnded { _ in pinching = false }
                 )
 
+            // 翻转过渡帧：换镜头那几帧会话要断一下（预览会黑），这层盖住黑屏再淡出，
+            // 观感就是平滑地切过去。取景方式和预览保持一致（4:3 装得下、16:9 铺满）。
+            if let overlay = engine.flipOverlay {
+                Image(uiImage: overlay)
+                    .resizable()
+                    .aspectRatio(contentMode: engine.quality.is4x3 ? .fit : .fill)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+                    .opacity(engine.flipOverlayOpacity)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
+
             if engine.showGrid { GridOverlay().ignoresSafeArea() }
 
             // 水印：开启才显示，位置对齐最终烧进视频的左下角

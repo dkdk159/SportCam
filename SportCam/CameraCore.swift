@@ -7,6 +7,7 @@ import Photos
 import CoreMotion
 import UIKit
 import Combine
+import SwiftUI
 
 // ============================================================
 //  相机核心：采集会话 / 语音控制 / 省电熄屏 / 看门狗
@@ -409,6 +410,11 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var battery: Float = 1
     @Published var torchOn = false
     @Published var dimmed = false
+    /// 翻转过渡：换镜头那几帧会话要断一下（预览会黑），用"换之前的最后一帧"盖在上面再淡出，
+    /// 视觉上就是平滑地切过去，而不是黑一下再跳出来 —— 参考 App 的丝滑观感就来自这里。
+    @Published var flipOverlay: UIImage?
+    /// 过渡帧不透明度：翻转时先瞬间置 1 盖住旧画面，换完镜头再淡出到 0，露出新画面
+    @Published var flipOverlayOpacity: Double = 0
     @Published var showLog = false
     @Published var logText = ""
     @Published var segmentCount = 0
@@ -519,6 +525,12 @@ final class CameraEngine: NSObject, ObservableObject {
     private let formatCacheLock = NSLock()
     private var formatCache: [String: AVCaptureDevice.Format] = [:]
     private var deliveredSize = CGSize.zero
+    /// 最近一帧的像素缓冲（sessionQueue 上读写）。翻转前把它转成图片当过渡帧用。
+    private var latestPixelBuffer: CVPixelBuffer?
+    /// 转图片用，建一次复用；放 sessionQueue 上用
+    private let snapshotContext = CIContext(options: [.useSoftwareRenderer: false])
+    /// 是否在等"换完镜头后的第一帧"来触发过渡帧淡出（只在 sessionQueue 上读写）
+    private var flipFadeArmed = false
     private var needEncoderRebuild = false
     private var lastKeyTime = CMTime.invalid
     private var clipIndex = 0
@@ -847,6 +859,11 @@ final class CameraEngine: NSObject, ObservableObject {
                 return
             }
 
+            // 换镜头会让预览黑一下。先把"当前这一帧"冻结成过渡画面盖上去，
+            // 换完镜头、新画面出来后再淡出 —— 用户看到的就是平滑过渡，
+            // 而不是"黑一下再跳出来"（参考 App 的丝滑感就是这么来的）。
+            let overlayShown = self.showFlipOverlay()
+
             let old = self.cameraInput
             // 换镜头前先关掉闪光灯：否则后置的灯会一直亮着，切到前置也关不掉
             // 闪光灯必须在拿到配置锁之后才能改。以前写的是 try? lockForConfiguration()
@@ -867,6 +884,7 @@ final class CameraEngine: NSObject, ObservableObject {
             guard self.session.canAddInput(input) else {
                 if let old = old { self.session.addInput(old) }
                 self.session.commitConfiguration()
+                if overlayShown { self.fadeOutFlipOverlay() }   // 没换成，也要把过渡帧撤掉
                 giveUp("翻转失败，请重试")
                 return
             }
@@ -886,6 +904,8 @@ final class CameraEngine: NSObject, ObservableObject {
             // 换了摄像头：分段格式已不一致，旧段全部作废
             self.recorder.reset()
             self.rearmPreRecord()
+            // 等新镜头的第一帧到达再淡出过渡帧（见 handleVideo 里的触发）
+            if overlayShown { self.armFlipFadeOut() }
             DispatchQueue.main.async {
                 self.cameraPosition = next
                 // 先落 cameraPosition 再落 fieldOfView：前者已是 .front 时，
@@ -925,6 +945,53 @@ final class CameraEngine: NSObject, ObservableObject {
         }
         if let connection = audioOutput.connection(with: .audio), !connection.isEnabled {
             connection.isEnabled = true
+        }
+    }
+
+    // MARK: 翻转过渡（用"最后一帧"盖住换镜头时的黑屏，做出丝滑切换）
+
+    /// 抓当前采集到的最后一帧，转成图片当过渡画面。成功返回 true。
+    /// 必须在 sessionQueue 上调用（latestPixelBuffer 也只在这条队列上更新）。
+    private func showFlipOverlay() -> Bool {
+        guard let buffer = latestPixelBuffer else { return false }
+        let ci = CIImage(cvPixelBuffer: buffer)
+        guard let cg = snapshotContext.createCGImage(ci, from: ci.extent) else { return false }
+        let image = UIImage(cgImage: cg)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.flipOverlay = image
+            // 立刻盖满：这里绝不能淡入，否则黑屏会先从底下露出来
+            self.flipOverlayOpacity = 1
+        }
+        return true
+    }
+
+    /// 布好"等新镜头第一帧"的触发；并有兜底，极端情况下不会永远盖着。
+    private func armFlipFadeOut() {
+        flipFadeArmed = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self = self else { return }
+            self.sessionQueue.async {
+                guard self.flipFadeArmed else { return }   // 已被第一帧触发过
+                self.flipFadeArmed = false
+                self.fadeOutFlipOverlay()
+            }
+        }
+    }
+
+    /// 淡出过渡帧（0.16s），随后清掉。新画面已经出来后调用。
+    /// 时长对标参考 App：它的切换只有 2~3 帧（约 66~100ms），非常干脆。
+    /// 这里留 0.06s 让预览层把新帧画上去（避免淡出中途露黑），再用 0.16s 快速叠化，
+    /// 总时长 ~0.22s，观感跟参考 App 一样"一眨眼就过去了"，而不是慢慢糊过来。
+    private func fadeOutFlipOverlay() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                withAnimation(.easeOut(duration: 0.16)) { self.flipOverlayOpacity = 0 }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                    self.flipOverlay = nil
+                }
+            }
         }
     }
 
@@ -1940,6 +2007,13 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
         lastFrameAt = Date()
         receivedFrames &+= 1
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
+        // 留一份最新帧：翻转时拿它当"换镜头前的最后一帧"，盖住会话重连时的黑屏
+        latestPixelBuffer = pixelBuffer
+        // 翻转后新镜头的第一帧到了：开始淡出过渡帧（覆盖期结束）
+        if flipFadeArmed {
+            flipFadeArmed = false
+            fadeOutFlipOverlay()
+        }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let size = CGSize(width: width, height: height)
