@@ -397,7 +397,9 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var zoom: CGFloat = 1.0 { didSet { if oldValue != zoom { applyZoom() } } }
     // 专业参数：0 表示自动
     @Published var cameraPosition: AVCaptureDevice.Position = .back
-    @Published var proControl: ProControl?          // 非空时弹出底部滑杆面板
+    @Published var proControl: ProControl?          // 非空时弹出参数面板
+    /// 参数面板打开时按 5Hz 自增，用来驱动实时数值刷新
+    @Published var proTick = 0
     @Published var exposureBias: Float = 0          // EV
     @Published var isoValue: Float = 0              // 0 = 自动
     @Published var shutterSeconds: Double = 0       // 0 = 自动
@@ -434,6 +436,7 @@ final class CameraEngine: NSObject, ObservableObject {
     private let proLock = NSLock()
     private var pendingPro: [ProControl] = []
     private var proDraining = false
+    private var proTickTimer: Timer?
     private let videoOutput = AVCaptureVideoDataOutput()
     private let audioOutput = AVCaptureAudioDataOutput()
     private let encoder = H264Encoder()
@@ -829,8 +832,45 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     // MARK: 专业参数（曝光 / ISO / 快门 / 白平衡）
-    func openPro(_ control: ProControl) { proControl = control }
-    func closePro() { proControl = nil }
+    func openPro(_ control: ProControl) {
+        proControl = control
+        startProTick()
+    }
+
+    func closePro() {
+        proControl = nil
+        stopProTick()
+    }
+
+    /// 面板打开时按 5Hz 推一下：自动模式下 ISO / 快门 / 白平衡 一直在变，
+    /// 不推 SwiftUI 就不会重绘，看上去就是"数值不动"。
+    private func startProTick() {
+        proTickTimer?.invalidate()
+        proTickTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            guard let self = self, self.proControl != nil else { return }
+            self.proTick &+= 1
+        }
+    }
+
+    private func stopProTick() {
+        proTickTimer?.invalidate()
+        proTickTimer = nil
+    }
+
+    /// 面板那一行用的紧凑实时值
+    func proShort(_ control: ProControl) -> String {
+        let raw = proEffective(control)
+        // 自动模式下偶尔会读到 0 / NaN，直接转 Int 会崩，先兜住
+        let value = raw.isFinite ? raw : 0
+        switch control {
+        case .exposure: return String(format: "%.1f", value)
+        case .shutter: return shutterText(value)
+        case .iso: return "\(Int(value.rounded()))"
+        case .whiteBalance: return "\(Int(value.rounded()))"
+        case .focus: return String(format: "%.2f", value)
+        case .zoom: return String(format: "%.1fx", value)
+        }
+    }
 
     /// 该参数是否已从自动切到手动
     func proIsManual(_ control: ProControl) -> Bool {
@@ -942,6 +982,8 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     private func shutterText(_ seconds: Double) -> String {
+        // 自动模式下可能读到 0，1/0 再转 Int 会崩
+        guard seconds.isFinite, seconds > 0 else { return "--" }
         if seconds >= 1 { return String(format: "%.0f\"", seconds) }
         return "1/\(Int((1.0 / seconds).rounded()))"
     }

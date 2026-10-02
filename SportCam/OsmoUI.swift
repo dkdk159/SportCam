@@ -295,7 +295,6 @@ struct CameraScreen: View {
                 // 参数面板贴在底栏上方：快门按钮始终露在外面
                 if let control = engine.proControl {
                     proSheet(control)
-                        .transition(.move(edge: .bottom))
                 }
                 bottomBar
             }
@@ -610,13 +609,9 @@ struct CameraScreen: View {
             }
             .buttonStyle(PlainButtonStyle())
 
-            // 一个按钮管全部专业参数：点开面板，里面六项随便切
+            // 一个按钮管全部专业参数：点开面板，里面几项随便切
             Button {
-                if engine.proControl == nil {
-                    engine.openPro(.exposure)
-                } else {
-                    engine.closePro()
-                }
+                setPro(engine.proControl == nil ? .exposure : nil)
             } label: {
                 VStack(spacing: 2) {
                     Image(systemName: "slider.horizontal.3")
@@ -670,19 +665,21 @@ struct CameraScreen: View {
     private func proSheet(_ control: ProControl) -> some View {
         let rangeText = engine.proRangeText(control)
         return VStack(spacing: 12) {
-            // 六个功能全在面板里，点一下就换，不用先关掉再开
-            HStack(spacing: 6) {
+            // 六项全在面板里，点一下就换；每项显示实时数值（自动模式下会一直跳）
+            HStack(spacing: 4) {
                 ForEach(ProControl.allCases) { item in
                     Button {
-                        engine.openPro(item)
+                        setPro(item)
                     } label: {
                         VStack(spacing: 3) {
-                            Image(systemName: item.icon)
-                                .font(.system(size: 15, weight: .medium))
-                            Text(item.rawValue)
-                                .font(.system(size: 9))
+                            Text(engine.proShort(item))
+                                .font(Palette.mono(12, .semibold))
                                 .lineLimit(1)
-                                .minimumScaleFactor(0.7)
+                                .minimumScaleFactor(0.6)
+                            Text(item.rawValue)
+                                .font(.system(size: 10))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.6)
                         }
                         .foregroundColor(item == control
                                          ? .black
@@ -694,6 +691,26 @@ struct CameraScreen: View {
                     }
                     .buttonStyle(PlainButtonStyle())
                 }
+
+                // 网格：一键开关构图辅助线
+                Button {
+                    engine.showGrid.toggle()
+                } label: {
+                    VStack(spacing: 3) {
+                        Text(engine.showGrid ? "开" : "关")
+                            .font(Palette.mono(12, .semibold))
+                        Text("网格")
+                            .font(.system(size: 10))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.6)
+                    }
+                    .foregroundColor(engine.showGrid ? Palette.appleYellow : .white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(Color.white.opacity(0.10))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+                .buttonStyle(PlainButtonStyle())
             }
 
             HStack(spacing: 10) {
@@ -713,7 +730,7 @@ struct CameraScreen: View {
                 }
                 .buttonStyle(PlainButtonStyle())
                 Button {
-                    engine.closePro()
+                    setPro(nil)
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 14, weight: .semibold))
@@ -750,6 +767,20 @@ struct CameraScreen: View {
         case "0.5x": return engine.fieldOfView == .ultraWide
         case "2x": return engine.fieldOfView == .wide && engine.zoom >= 1.8
         default: return engine.fieldOfView == .wide && engine.zoom < 1.8
+        }
+    }
+
+    /// 开关参数面板。显式关掉动画 —— 否则面板会在收起的过程中滑过底栏，
+    /// 出现"关掉了但下面还压着一层"的残影。
+    private func setPro(_ control: ProControl?) {
+        var trans = Transaction()
+        trans.disablesAnimations = true
+        withTransaction(trans) {
+            if let control = control {
+                engine.openPro(control)
+            } else {
+                engine.closePro()
+            }
         }
     }
 
