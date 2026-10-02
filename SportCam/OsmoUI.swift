@@ -30,6 +30,8 @@ private struct CameraPreview: UIViewRepresentable {
     let orientation: AVCaptureVideoOrientation
     /// 前置摄像头时预览要镜像（录制出来的画面仍是非镜像）
     let mirrored: Bool
+    /// 防抖模式：预览也按设置里的档位来，取景器里看到的抖动抑制就是录进去的效果
+    let stabilization: AVCaptureVideoStabilizationMode
     /// 音量键 / iPhone 16 相机按钮：按一下切换录制
     let onCaptureButton: () -> Void
     /// 点按画面：分别给出「设备坐标」（给对焦用）和「屏幕坐标」（给对焦框用）
@@ -62,6 +64,10 @@ private struct CameraPreview: UIViewRepresentable {
         context.coordinator.onFocusPoint = onFocusPoint
         let tap = UITapGestureRecognizer(target: context.coordinator,
                                          action: #selector(Coordinator.handleTap(_:)))
+        // 预览铺满全屏，这个对焦手势挂在它上面。默认 cancelsTouchesInView = true 时，
+        // 落在预览范围内的触摸会被它抢先吃掉 —— 表现就是"点焦段档位有时候点不动"。
+        // 关掉它，对焦照常，触摸照样能传给上层的按钮。
+        tap.cancelsTouchesInView = false
         view.addGestureRecognizer(tap)
         apply(view)
         return view
@@ -79,6 +85,10 @@ private struct CameraPreview: UIViewRepresentable {
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
             connection.isVideoMirrored = mirrored
+        }
+        if connection.isVideoStabilizationSupported,
+           connection.preferredVideoStabilizationMode != stabilization {
+            connection.preferredVideoStabilizationMode = stabilization
         }
     }
 }
@@ -107,7 +117,8 @@ private struct CircleIcon: View {
 
 /// 焦段档位（0.5x / 1x / 2x）。
 /// 选中状态用动画过渡 —— 直接硬切会"啪"地闪一下，看着像是在重新加载画面。
-/// 热区做到 46×38：原来只有 34 的圆点，手指压不准，会有"点不动"的感觉。
+/// 热区做到 56×40：原来只有 34 的圆点，手指压不准，会有"点不动"的感觉。
+/// contentShape 放在 label 的 frame 上 —— 保证整个矩形都是热区，而不是只有字形那一点点。
 private struct ZoomChip: View {
     let label: String
     let selected: Bool
@@ -120,9 +131,12 @@ private struct ZoomChip: View {
             action()
         } label: {
             Text(label)
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(selected ? .black : .white)
-                .frame(width: 46, height: 38)
+                // 60×44：达到苹果建议的最小点按尺寸。之前 34 的圆点太窄，
+                // 左手拇指从左侧斜着按下来经常落在缝里 —— 就是"左手点不动、右手能点"的原因。
+                .frame(width: 60, height: 44)
+                .contentShape(Rectangle())
                 .background(selected ? Color.white : Color.clear)
                 .clipShape(Capsule())
                 .scaleEffect(selected ? 1.0 : 0.96)
@@ -309,6 +323,7 @@ struct CameraScreen: View {
             CameraPreview(session: engine.session,
                           orientation: engine.videoOrientation,
                           mirrored: engine.cameraPosition == .front,
+                          stabilization: engine.antiShake.mode,
                           onCaptureButton: {
                               // 音量键 / iPhone 16 相机按钮 → 切换录制（设置里可关）
                               if engine.volumeKeyRecording { engine.toggleRecording() }
@@ -661,8 +676,9 @@ struct CameraScreen: View {
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.white)
 
-                HStack(spacing: 10) {
-                    ForEach(VideoQuality.allCases) { item in
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3),
+                          spacing: 10) {
+                    ForEach(engine.availableQualities) { item in
                         formatCell(item.rawValue, selected: engine.quality == item) {
                             engine.quality = item
                         }
@@ -1119,7 +1135,7 @@ struct SettingsSheet: View {
             Form {
                 Section(header: Text("画面")) {
                     Picker("分辨率", selection: $engine.quality) {
-                        ForEach(VideoQuality.allCases) { Text($0.rawValue).tag($0) }
+                        ForEach(engine.availableQualities) { Text($0.rawValue).tag($0) }
                     }.disabled(engine.isRecording)
                     Picker("帧率", selection: $engine.frameRate) {
                         ForEach(FrameRate.allCases) { Text($0.label).tag($0) }

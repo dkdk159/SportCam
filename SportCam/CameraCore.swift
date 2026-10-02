@@ -32,19 +32,34 @@ enum VideoQuality: String, CaseIterable, Identifiable {
     case k4 = "4K"
     case p1080 = "1080P"
     case p720 = "720P"
+    case p1080x43 = "1080P 4:3"
+    case k4x43 = "4K 4:3"
     var id: String { rawValue }
+
+    /// 4:3 用满传感器高度：同样焦距下上下视野更宽，参考 App 里的「超广视野」就是它
+    var is4x3: Bool { self == .p1080x43 || self == .k4x43 }
+
+    /// 画面宽高比（传感器方向，宽 > 高）
+    var aspect: Double { is4x3 ? 4.0 / 3.0 : 16.0 / 9.0 }
+
+    /// 4:3 没有对应的 sessionPreset，交给设备 activeFormat 决定：
+    /// 用 inputPriority 让会话完全听设备的格式，不再被预置裁回 16:9。
     var preset: AVCaptureSession.Preset {
         switch self {
         case .k4: return .hd4K3840x2160
         case .p1080: return .hd1920x1080
         case .p720: return .hd1280x720
+        case .p1080x43, .k4x43: return .inputPriority
         }
     }
+
     var size: (width: Int, height: Int) {
         switch self {
         case .k4: return (3840, 2160)
         case .p1080: return (1920, 1080)
         case .p720: return (1280, 720)
+        case .p1080x43: return (1440, 1080)
+        case .k4x43: return (2880, 2160)
         }
     }
 }
@@ -493,6 +508,10 @@ final class CameraEngine: NSObject, ObservableObject {
     }
     private var cameraInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
+    /// 每颗摄像头建好的 input 缓存起来复用。
+    /// 重建 AVCaptureDeviceInput 要重新配置设备，很慢；反复 0.5x ↔ 1x 时每次重建
+    /// 就是"点了半天没反应"的元凶。只在 sessionQueue 上访问，无需加锁。
+    private var inputCache: [String: AVCaptureDeviceInput] = [:]
     /// 换镜头（0.5x ↔ 1x）前先放好目标倍数，switchLens 切完镜头再套用，避免白白回到 1x
     private var pendingZoom: CGFloat = 1.0
     /// 每台设备上「画质 + 帧率」挑好的格式，选一次就记住。
@@ -710,7 +729,7 @@ final class CameraEngine: NSObject, ObservableObject {
         if session.canSetSessionPreset(quality.preset) { session.sessionPreset = quality.preset }
 
         if let device = camera(cameraPosition, fieldOfView: fieldOfView),
-           let input = try? AVCaptureDeviceInput(device: device),
+           let input = cachedInput(for: device),
            session.canAddInput(input) {
             session.addInput(input)
             cameraDevice = device
@@ -763,10 +782,27 @@ final class CameraEngine: NSObject, ObservableObject {
         if let device = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) {
             return device
         }
-        let types: [AVCaptureDevice.DeviceType] = [.builtInTripleCamera, .builtInDualWideCamera]
-        return AVCaptureDevice.DiscoverySession(deviceTypes: types,
-                                                mediaType: .video,
-                                                position: .back).devices.first
+        // 部分机型只把超广角暴露在「三摄 / 双广角」这类虚拟设备里：
+        // 这种虚拟设备的最广一端就是超广角，videoZoomFactor 1.0 即 0.5x 视野。
+        // 用一次性 DiscoverySession 把后置所有镜头都列出来，逐个按类型取，避免漏。
+        let types: [AVCaptureDevice.DeviceType] = [
+            .builtInUltraWideCamera, .builtInTripleCamera, .builtInDualWideCamera
+        ]
+        let devices = AVCaptureDevice.DiscoverySession(deviceTypes: types,
+                                                       mediaType: .video,
+                                                       position: .back).devices
+        if let ultra = devices.first(where: { $0.deviceType == .builtInUltraWideCamera }) { return ultra }
+        if let triple = devices.first(where: { $0.deviceType == .builtInTripleCamera }) { return triple }
+        if let dualWide = devices.first(where: { $0.deviceType == .builtInDualWideCamera }) { return dualWide }
+        return nil
+    }
+
+    /// 取（或首次创建）某台摄像头的 input。只在 sessionQueue 上调用。
+    private func cachedInput(for device: AVCaptureDevice) -> AVCaptureDeviceInput? {
+        if let cached = inputCache[device.uniqueID] { return cached }
+        guard let input = try? AVCaptureDeviceInput(device: device) else { return nil }
+        inputCache[device.uniqueID] = input
+        return input
     }
 
     /// 前后摄像头翻转。
@@ -782,9 +818,9 @@ final class CameraEngine: NSObject, ObservableObject {
         stateLock.unlock()
 
         let next: AVCaptureDevice.Position = cameraPosition == .back ? .front : .back
-        // 先让界面切过去：镜像、按钮高亮立刻响应，失败再退回来
-        cameraPosition = next
-
+        // 注意：这里故意不提前改 cameraPosition。
+        // 提前改会让预览先按新方向镜像翻一次，随后换 input 再黑一下 —— 两次视觉变化叠起来
+        // 就是用户看到的"翻回去会闪一下"。改成换完镜头后在主线程一次性落状态，视觉只变一次。
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
             defer {
@@ -794,10 +830,7 @@ final class CameraEngine: NSObject, ObservableObject {
             }
 
             func giveUp(_ reason: String) {
-                DispatchQueue.main.async {
-                    self.cameraPosition = next == .back ? .front : .back
-                    self.message(reason)
-                }
+                DispatchQueue.main.async { self.message(reason) }
             }
 
             guard !self.recording else {
@@ -809,7 +842,7 @@ final class CameraEngine: NSObject, ObservableObject {
             // 前置只有广角：切过去时把视角收回广角，免得切回来时焦段对不上
             let fov: FieldOfView = next == .front ? .wide : self.fieldOfView
             guard let device = self.camera(next, fieldOfView: fov),
-                  let input = try? AVCaptureDeviceInput(device: device) else {
+                  let input = self.cachedInput(for: device) else {
                 giveUp("该机型不支持翻转")
                 return
             }
@@ -906,11 +939,29 @@ final class CameraEngine: NSObject, ObservableObject {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
 
-            let matched = cached ?? device.formats.first(where: { format in
-                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                guard Int(dims.width) >= target.width, Int(dims.height) >= target.height else { return false }
-                return format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= fps && fps <= $0.maxFrameRate }
-            })
+            // 选格式：既要比目标分辨率大，宽高比也要对得上。
+            // 关键：4:3 绝不能匹配到同高的 16:9（1440×1080 与 1920×1080 高度相同），
+            // 否则「4:3 超广视野」会退化成普通 16:9 裁切，看着就是没变化。
+            // 满足条件的里面挑面积最小的那颗，避免想要 1080P 却给了 4K。
+            func pick(aspect wanted: Double) -> AVCaptureDevice.Format? {
+                let list = device.formats.filter { format in
+                    let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                    let w = Int(dims.width), h = Int(dims.height)
+                    guard w >= target.width, h >= target.height else { return false }
+                    let aspect = Double(w) / Double(h)
+                    guard abs(aspect - wanted) < 0.06 else { return false }
+                    return format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= fps && fps <= $0.maxFrameRate }
+                }
+                return list.min { lhs, rhs in
+                    let a = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
+                    let b = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
+                    return Int(a.width) * Int(a.height) < Int(b.width) * Int(b.height)
+                }
+            }
+
+            // 本机没有 4:3 时退回 16:9：宁可少一点视野，也不能让会话停在半套格式上
+            var matched = cached ?? pick(aspect: quality.aspect)
+            if matched == nil, quality.is4x3 { matched = pick(aspect: 16.0 / 9.0) }
             if let matched = matched {
                 if cached == nil {
                     formatCacheLock.lock()
@@ -957,7 +1008,7 @@ final class CameraEngine: NSObject, ObservableObject {
                 return
             }
 
-            guard let input = try? AVCaptureDeviceInput(device: device) else { return }
+            guard let input = self.cachedInput(for: device) else { return }
             let old = self.cameraInput
             self.session.beginConfiguration()
             if let old = old { self.session.removeInput(old) }
@@ -1066,11 +1117,25 @@ final class CameraEngine: NSObject, ObservableObject {
     var zoomChips: [String] { ["0.5x", "1x", "2x"].filter { isZoomChipAvailable($0) } }
     /// 后置有没有超广角镜头（0.5x 靠它）。开机算一次就够，查设备不该每帧都跑。
     @Published var ultraWideAvailable = false
+    /// 本机摄像头有没有真正的 4:3 视频格式（没有就不摆这两档，免得选了没效果）
+    @Published var supports4x3 = false
 
     func refreshLensAvailability() {
         // 和「视角」列表、实际切镜头同源（都走 ultraWideDevice）：
         // 三处结论必须一致，否则会出现「有 0.5x 档、视角里却没有超广角」这种自相矛盾。
         ultraWideAvailable = ultraWideDevice() != nil
+        let back = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        supports4x3 = back?.formats.contains { format in
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            guard Int(dims.width) >= 1440 else { return false }
+            return abs(Double(dims.width) / Double(dims.height) - 4.0 / 3.0) < 0.06
+        } ?? false
+        Log.write("[镜头] 超广角\(ultraWideAvailable ? "可用" : "不可用") · 4:3\(supports4x3 ? "可用" : "不可用")")
+    }
+
+    /// 可用的分辨率档：4:3 只有本机真支持才摆出来
+    var availableQualities: [VideoQuality] {
+        VideoQuality.allCases.filter { !$0.is4x3 || supports4x3 }
     }
 
     /// 这一档在当前机型/当前镜头上能不能用。0.5x 需要后置超广角，前置也做不了。
