@@ -107,23 +107,29 @@ private struct CircleIcon: View {
 
 /// 焦段档位（0.5x / 1x / 2x）。
 /// 选中状态用动画过渡 —— 直接硬切会"啪"地闪一下，看着像是在重新加载画面。
+/// 热区做到 46×38：原来只有 34 的圆点，手指压不准，会有"点不动"的感觉。
 private struct ZoomChip: View {
     let label: String
     let selected: Bool
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            // 轻微触感 + 立刻回调：先给手指一个回应，再去做切镜头这种"慢活"
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            action()
+        } label: {
             Text(label)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(selected ? .black : .white)
-                .frame(width: 34, height: 34)
+                .frame(width: 46, height: 38)
                 .background(selected ? Color.white : Color.clear)
-                .clipShape(Circle())
-                .scaleEffect(selected ? 1.0 : 0.94)
-                .animation(.easeOut(duration: 0.18), value: selected)
+                .clipShape(Capsule())
+                .scaleEffect(selected ? 1.0 : 0.96)
+                .animation(.spring(response: 0.22, dampingFraction: 0.82), value: selected)
         }
         .buttonStyle(PlainButtonStyle())
+        .contentShape(Rectangle())
     }
 }
 
@@ -1126,15 +1132,14 @@ struct SettingsSheet: View {
                     }.disabled(engine.isRecording)
                 }
 
-                Section(header: Text("降噪"),
-                        footer: Text(engine.denoiseOn && !engine.denoiseNote.isEmpty
-                                     ? "已生效：\(engine.denoiseNote)"
-                                     : "开启后抑制麦克风风噪，并在暗光下压制画面噪点。是否可用取决于机型和系统版本。")) {
-                    Toggle("降噪", isOn: $engine.denoiseOn)
+                Section(header: Text("拍摄辅助")) {
+                    Toggle("构图网格", isOn: $engine.showGrid)
+                    Toggle("水平仪", isOn: $engine.showLevel)
+                    Toggle("录制提示音", isOn: $engine.beepOn)
                 }
 
                 Section(header: Text("水印"),
-                        footer: Text("开启后会把水印烧进视频左下角，预览上同款显示。需要定位权限、天气需要联网；关闭时完全不定位、不联网、不写入画面。\n要显示哪些内容，在拍摄界面右下角的「水印时间」里逐项勾选。")) {
+                        footer: Text("水印烧进画面左下角，预览同款显示。需要定位权限，天气需联网；关闭后不定位、不联网、不写入。\n显示哪些内容，在拍摄界面右下角「水印时间」里逐项勾选。")) {
                     Toggle("时间地点水印", isOn: $engine.watermarkOn)
                     if engine.watermarkOn {
                         HStack {
@@ -1192,17 +1197,14 @@ struct SettingsSheet: View {
                     }
                 }
 
-                Section(header: Text("省电"),
-                        footer: Text("熄屏后继续录制，上滑屏幕即可唤醒。")) {
+                Section(header: Text("性能与续航"),
+                        footer: Text(engine.denoiseOn && !engine.denoiseNote.isEmpty
+                                     ? "降噪已生效：\(engine.denoiseNote)\n熄屏后继续录制，上滑屏幕即可唤醒。"
+                                     : "降噪：抑制麦克风风噪，并在暗光下压制画面噪点（是否可用取决于机型和系统）。\n熄屏后继续录制，上滑屏幕即可唤醒。")) {
+                    Toggle("降噪", isOn: $engine.denoiseOn)
                     Picker("自动熄屏", selection: $engine.powerSave) {
                         ForEach(PowerSaveDelay.allCases) { Text($0.label).tag($0) }
                     }
-                }
-
-                Section(header: Text("拍摄辅助")) {
-                    Toggle("构图网格", isOn: $engine.showGrid)
-                    Toggle("水平仪", isOn: $engine.showLevel)
-                    Toggle("录制提示音", isOn: $engine.beepOn)
                 }
 
                 Section(header: Text("按键"),

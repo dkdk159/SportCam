@@ -1,5 +1,7 @@
 import Foundation
 import AVFoundation
+import CoreImage
+import CoreVideo
 import Speech
 import Photos
 import CoreMotion
@@ -248,13 +250,22 @@ final class VoiceControl {
         let clean = text.replacingOccurrences(of: " ", with: "")
         guard !clean.isEmpty else { return }
         let now = Date()
-        if startWords.contains(where: { clean.contains($0) }) {
+
+        // 部分结果里关键词往往先于整句出现（先听见"开始"，"录像"两字才跟上）。
+        // 所以除了整词匹配，再加一条宽松规则：动词 + "录/拍" 同时出现就算命中，
+        // 口令能提前小半秒生效，不用等识别器把整句收尾 —— 这就是"语音迟钝"的来源之一。
+        let wantsStart = startWords.contains { clean.contains($0) }
+            || (Self.startVerbs.contains { clean.contains($0) } && Self.recordWords.contains { clean.contains($0) })
+        let wantsStop = stopWords.contains { clean.contains($0) }
+            || (Self.stopVerbs.contains { clean.contains($0) } && Self.recordWords.contains { clean.contains($0) })
+
+        if wantsStart {
             if now.timeIntervalSince(lastStart) > 2.5 {
                 lastStart = now
                 Log.write("[语音] 命中开始口令")
                 DispatchQueue.main.async { [weak self] in self?.onStart?() }
             }
-        } else if stopWords.contains(where: { clean.contains($0) }) {
+        } else if wantsStop {
             if now.timeIntervalSince(lastStop) > 2.5 {
                 lastStop = now
                 Log.write("[语音] 命中停止口令")
@@ -262,6 +273,11 @@ final class VoiceControl {
             }
         }
     }
+
+    /// 宽松匹配用的词根（只在本类内使用，不影响设置里可自定义的口令表）
+    private static let startVerbs = ["开始", "开启", "启动"]
+    private static let stopVerbs = ["停止", "结束", "关闭", "保存"]
+    private static let recordWords = ["录像", "录制", "拍摄", "录"]
 
     func feed(_ sample: CMSampleBuffer) {
         lock.lock()
@@ -430,10 +446,15 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var watermarkOn = false { didSet { if oldValue != watermarkOn { syncWatermark() } } }
     /// 水印里显示哪几项（时间/地点/描述/海拔/天气/温度/气压/风速）
     @Published var watermarkItems: Set<WatermarkItem> = WatermarkItem.default {
-        didSet { if oldValue != watermarkItems { saveWatermarkSettings() } }
+        didSet {
+            if oldValue != watermarkItems {
+                saveWatermarkSettings()
+                refreshBurnSnapshot()
+            }
+        }
     }
     /// 水印数据：地点 / 海拔 / 天气…，定位和天气各填一半，谁先回来谁先显示
-    @Published var watermarkData = WatermarkData()
+    @Published var watermarkData = WatermarkData() { didSet { refreshBurnSnapshot() } }
     /// 定位异常提示（只在设置页显示，不会写进视频）
     @Published var locationNote = ""
     /// 用户是否主动碰过水印（开过面板 / 勾过项）。启动预热不要在这种时候把定位停掉
@@ -491,6 +512,37 @@ final class CameraEngine: NSObject, ObservableObject {
     private var lastCaptureRescue = Date.distantPast
     private var lastEncoderRescue = Date.distantPast
 
+    // MARK: 录制期水印烧录
+    // 目的：录制时就把水印画进每一帧，落盘的分段本身就是带水印的，
+    // 停止录制后只需无损拼接 → 保存几乎瞬间完成（不再重编码）。
+    // 代价是录制时每帧多一次 CoreImage 合成（走 GPU，1080p 每帧几毫秒）。
+    private let burnContext = CIContext(options: [.useSoftwareRenderer: false])
+    private var burnRenderer: WatermarkRenderer?
+    private var burnRendererSize = CGSize.zero
+    private var burnPool: CVPixelBufferPool?
+    private var burnPoolSize = CGSize.zero
+    /// 采集线程读、主线程写这三项 → 用锁保护快照
+    private let burnLock = NSLock()
+    private var burnOn = false
+    private var burnItems: Set<WatermarkItem> = []
+    private var burnData = WatermarkData()
+    /// 本次录制是否真的把水印烧进了画面：合并时据此决定还要不要再叠一次
+    private var clipBurnedWatermark = false
+
+    /// 把主线程的水印状态快照给采集线程用（采集线程不能直接读 @Published）
+    private func refreshBurnSnapshot() {
+        burnLock.lock()
+        burnOn = watermarkOn
+        burnItems = watermarkItems
+        burnData = watermarkData
+        burnLock.unlock()
+    }
+
+    private var burnSnapshotOn: Bool {
+        burnLock.lock(); defer { burnLock.unlock() }
+        return burnOn
+    }
+
     // 跨线程状态
     private let stateLock = NSLock()
     private var flagRecording = false
@@ -511,8 +563,10 @@ final class CameraEngine: NSObject, ObservableObject {
     func launch() {
         configureAudioSession()
         level.start()
+        sound.prepare()             // 提示音提前预热，按下秒响（不然第一下总慢半拍）
         refreshLensAvailability()   // 本机有没有超广角（决定 0.5x 能不能用）
         loadWatermarkSettings()     // 上次勾的水印项和自定义描述
+        refreshBurnSnapshot()       // 把加载后的水印状态同步给采集线程
         prewarmLocation()           // 已授权就先把位置取一次，点水印时不用干等
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
 
@@ -690,6 +744,7 @@ final class CameraEngine: NSObject, ObservableObject {
         if position == .front {
             return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
         }
+        if fov == .ultraWide, let ultra = ultraWideDevice() { return ultra }
         return AVCaptureDevice.default(fov.lens, for: .video, position: .back)
             ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
     }
@@ -697,7 +752,21 @@ final class CameraEngine: NSObject, ObservableObject {
     /// 严格按镜头类型取设备：本机没有这颗镜头（比如 iPhone 8 Plus 没有超广角）就返回 nil，
     /// 用来在切焦段之前判断"到底需不需要动会话"。
     private func lensDevice(_ fov: FieldOfView) -> AVCaptureDevice? {
-        AVCaptureDevice.default(fov.lens, for: .video, position: .back)
+        if fov == .ultraWide { return ultraWideDevice() }
+        return AVCaptureDevice.default(fov.lens, for: .video, position: .back)
+    }
+
+    /// 后置超广角：优先取独立的那颗；个别机型只把超广角藏在「三摄 / 双广角」虚拟设备里，
+    /// 这时退回虚拟设备（它的 1x 端就是超广角），保证有超广角的机器一定用得上 0.5x。
+    /// 「视角」列表、0.5x 档位、实际切镜头都必须走这一个入口，三处结论才一致。
+    private func ultraWideDevice() -> AVCaptureDevice? {
+        if let device = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) {
+            return device
+        }
+        let types: [AVCaptureDevice.DeviceType] = [.builtInTripleCamera, .builtInDualWideCamera]
+        return AVCaptureDevice.DiscoverySession(deviceTypes: types,
+                                                mediaType: .video,
+                                                position: .back).devices.first
     }
 
     /// 前后摄像头翻转。
@@ -999,22 +1068,9 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var ultraWideAvailable = false
 
     func refreshLensAvailability() {
-        // 后置超广角有两种存在形式：独立的一颗，或者藏在三摄/双广角虚拟设备里。
-        // 用 DiscoverySession 一起查，避免某些机型上单独取 .builtInUltraWideCamera 取不到，
-        // 结果"有超广角的机器也看不到 0.5x"。
-        let types: [AVCaptureDevice.DeviceType] = [.builtInUltraWideCamera,
-                                                   .builtInTripleCamera,
-                                                   .builtInDualWideCamera]
-        let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: types,
-                                                         mediaType: .video,
-                                                         position: .back)
-        if !discovery.devices.isEmpty {
-            ultraWideAvailable = true
-        } else {
-            ultraWideAvailable = AVCaptureDevice.default(.builtInUltraWideCamera,
-                                                         for: .video,
-                                                         position: .back) != nil
-        }
+        // 和「视角」列表、实际切镜头同源（都走 ultraWideDevice）：
+        // 三处结论必须一致，否则会出现「有 0.5x 档、视角里却没有超广角」这种自相矛盾。
+        ultraWideAvailable = ultraWideDevice() != nil
     }
 
     /// 这一档在当前机型/当前镜头上能不能用。0.5x 需要后置超广角，前置也做不了。
@@ -1433,6 +1489,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
     /// 水印总开关：打开才开始定位 / 取天气，关掉立刻停，不留后台定位
     private func syncWatermark() {
+        refreshBurnSnapshot()          // 开关一变，采集线程下一帧就要知道
         if watermarkOn {
             Log.write("[水印] 开启")
             ensureWatermarkStarted()
@@ -1530,6 +1587,8 @@ final class CameraEngine: NSObject, ObservableObject {
             recorder.arm(preRecordSeconds: 0)
             stateLock.lock(); flagForceKey = true; stateLock.unlock()
         }
+        // 录制期若正在烧水印（含预录段），落盘的分段自带水印 → 停止时无需再重编码
+        clipBurnedWatermark = burnSnapshotOn
         recorder.beginClip()
         Log.write("[录制] 开始")
     }
@@ -1568,8 +1627,9 @@ final class CameraEngine: NSObject, ObservableObject {
                 return
             }
             let output = self.nextClipURL()
-            // 水印：视频第 0 秒 = 最早那段开始写盘的真实时刻
-            let mark: WatermarkConfig? = self.watermarkOn ? WatermarkConfig(
+            // 水印：录制期已经烧进画面了 → 传 nil，合并走 Passthrough 无损秒存；
+            // 只有"录制时没烧"（比如中途才打开水印）才在这里补一层，那才需要重编码。
+            let mark: WatermarkConfig? = (self.watermarkOn && !self.clipBurnedWatermark) ? WatermarkConfig(
                 data: self.watermarkData,
                 items: self.watermarkItems,
                 startDate: clip.segments.map { $0.createdAt }.min() ?? Date()
@@ -1827,7 +1887,57 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
             }
         }
         // 分段要在关键帧处切，段内关键帧密度由上面这条保证（约 1 秒一个）
-        encoder.encode(pixelBuffer, at: time, forceKey: forceKey)
+        // 录制期烧录水印：把水印直接画进这一帧，落盘的分段本身就是成品，
+        // 停止录制后只需无损拼接 → 保存几乎瞬间完成（不再重编码）。
+        var frame = pixelBuffer
+        burnLock.lock()
+        let burning = burnOn
+        let items = burnItems
+        let data = burnData
+        burnLock.unlock()
+        if burning, let burned = burnFrame(pixelBuffer, size: size, items: items, data: data) {
+            frame = burned
+        }
+        encoder.encode(frame, at: time, forceKey: forceKey)
+    }
+
+    /// 把水印合成到一帧上（走 Core Image / GPU，1080p 每帧几毫秒）。
+    /// 目标 buffer 从池里取 —— 逐帧新分配会让内存一路涨，录久了直接被系统杀掉。
+    private func burnFrame(_ source: CVPixelBuffer, size: CGSize,
+                           items: Set<WatermarkItem>, data: WatermarkData) -> CVPixelBuffer? {
+        if burnRenderer == nil || burnRendererSize != size {
+            burnRenderer = WatermarkRenderer(renderSize: size)
+            burnRendererSize = size
+        }
+        guard let renderer = burnRenderer,
+              let overlay = renderer.overlay(for: Date(), data: data, items: items) else { return nil }
+
+        // 目标用 BGRA：Core Image 对它支持最稳，编码器内部再转回 YUV
+        if burnPool == nil || burnPoolSize != size {
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: Int(size.width),
+                kCVPixelBufferHeightKey as String: Int(size.height),
+                kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
+            ]
+            var pool: CVPixelBufferPool?
+            guard CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool) == kCVReturnSuccess else {
+                return nil
+            }
+            burnPool = pool
+            burnPoolSize = size
+        }
+        guard let pool = burnPool else { return nil }
+
+        var target: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &target) == kCVReturnSuccess,
+              let dest = target else { return nil }
+
+        let base = CIImage(cvPixelBuffer: source)
+        let bounds = CGRect(origin: .zero, size: size)
+        burnContext.render(overlay.composited(over: base), to: dest, bounds: bounds,
+                           colorSpace: CGColorSpaceCreateDeviceRGB())
+        return dest
     }
 
     private func handleAudio(_ sample: CMSampleBuffer) {

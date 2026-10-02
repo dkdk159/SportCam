@@ -161,21 +161,46 @@ final class H264Encoder {
 // MARK: - 提示音
 final class SoundPlayer {
     private let queue = DispatchQueue(label: "com.sportcam.sound")
-    private var player: AVAudioPlayer?
-    private lazy var startTone = Self.makeTone([(0.00, 0.07), (0.12, 0.07), (0.24, 0.16)])
-    private lazy var stopTone = Self.makeTone([(0.00, 0.20)])
+    private var startPlayer: AVAudioPlayer?
+    private var stopPlayer: AVAudioPlayer?
 
-    func playStart() { play(startTone) }
-    func playStop() { play(stopTone) }
+    private static let startTone = makeTone([(0.00, 0.07), (0.12, 0.07), (0.24, 0.16)])
+    private static let stopTone = makeTone([(0.00, 0.20)])
 
-    private func play(_ data: Data) {
+    /// 预热：把两个提示音提前建好并 prepareToPlay。
+    /// 原来每次点击才 AVAudioPlayer(data:) + 现场合成波形 + prepare，
+    /// 第一次按下去必然慢半拍 —— "开始/停止迟钝"有一部分就出在这儿。
+    func prepare() {
         queue.async { [weak self] in
-            guard let self = self, let audio = try? AVAudioPlayer(data: data) else { return }
-            audio.volume = 1.0
-            audio.prepareToPlay()
-            audio.play()
-            self.player = audio
+            guard let self = self else { return }
+            if self.startPlayer == nil { self.startPlayer = Self.build(Self.startTone) }
+            if self.stopPlayer == nil { self.stopPlayer = Self.build(Self.stopTone) }
         }
+    }
+
+    func playStart() { play(isStart: true) }
+    func playStop() { play(isStart: false) }
+
+    private func play(isStart: Bool) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            var audio = isStart ? self.startPlayer : self.stopPlayer
+            if audio == nil {
+                // 还没预热过（比如刚启动就被点）：现场建一个，顺手存下来下次直接用
+                audio = Self.build(isStart ? Self.startTone : Self.stopTone)
+                if isStart { self.startPlayer = audio } else { self.stopPlayer = audio }
+            }
+            // 上一条还在响就从头重放，不等它播完 —— 连点两次也要两次都有声
+            audio?.currentTime = 0
+            audio?.play()
+        }
+    }
+
+    private static func build(_ data: Data) -> AVAudioPlayer? {
+        guard let player = try? AVAudioPlayer(data: data) else { return nil }
+        player.volume = 1.0
+        player.prepareToPlay()
+        return player
     }
 
     private static func makeTone(_ pattern: [(Double, Double)]) -> Data {
