@@ -228,6 +228,21 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         geocoder.cancelGeocode()
     }
 
+    /// 立刻补一次数据（面板打开 / 手动刷新用）。
+    /// 没在跑就正常启动（会重放缓存）；已在跑就重放一次已知位置并请求一个新点 ——
+    /// 这样就不会再出现"开着定位中，非要关掉重开才出数据"。
+    func requestRefresh() {
+        guard running else { start(); return }
+        if let known = manager.location, abs(known.timestamp.timeIntervalSinceNow) < 3600 {
+            // 反查地名有配额，太密了会被限流：6 秒内只补一次
+            if Date().timeIntervalSince(lastGeocodeAt) > 6 { resolve(known) }
+            DispatchQueue.main.async {
+                self.onFix?(known.coordinate, known.altitude, known.verticalAccuracy >= 0)
+            }
+        }
+        manager.requestLocation()
+    }
+
     // MARK: CLLocationManagerDelegate
     func locationManager(_ manager: CLLocationManager, didChangeAuthorization status: CLAuthorizationStatus) {
         guard running else { return }
@@ -337,10 +352,19 @@ final class WeatherProvider {
         guard let url = comps?.url else { return }
 
         task?.cancel()
-        task = URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-            guard let self = self, let data = data,
+        task = URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
+            guard let self = self else { return }
+            guard let data = data,
                   let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let current = root["current"] as? [String: Any] else { return }
+                  let current = root["current"] as? [String: Any] else {
+                // 取失败就把节流窗口放宽到 30 秒后再试；否则会一直卡在"获取中…"，
+                // 要用户关掉重开才动 —— 这就是之前"要二次刷新"的原因之一。
+                DispatchQueue.main.async {
+                    self.lastAt = Date().addingTimeInterval(-570)
+                    Log.write("[水印] 天气获取失败 \(error?.localizedDescription ?? "无数据")")
+                }
+                return
+            }
 
             var snap = Snapshot()
             snap.temperature = (current["temperature_2m"] as? NSNumber)?.doubleValue ?? 0
@@ -427,7 +451,8 @@ final class WatermarkRenderer {
     private func render(lines: [String]) -> UIImage? {
         guard size.width > 8, size.height > 8 else { return nil }
 
-        let fontSize = max(size.height * 0.024, 15)
+        // 字号对齐参考 App：按画面高度取 1.75%（原来 2.4% 偏大，整块显得笨重）
+        let fontSize = max(size.height * 0.0175, 12)
         let margin = size.width * 0.035
         // 整块限制在屏宽的 66% 以内：地址长就自己折行，不会甩出一条横贯全屏的长线
         let maxWidth = size.width * 0.66

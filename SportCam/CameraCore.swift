@@ -410,8 +410,10 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var preRecordDelay: PreRecordDelay = .s15 { didSet { if oldValue != preRecordDelay { syncPreRecord() } } }
     @Published var powerSave: PowerSaveDelay = .never { didSet { resetPowerTimer() } }
     @Published var showGrid = true
-    /// 左上角「剩余空间 / 可录时长」显示开关
-    @Published var showStorage = true
+    /// 左上角「剩余空间 / 可录时长」显示开关（默认关闭，设置里最末尾可打开）
+    @Published var showStorage = false
+    /// 音量键 / iPhone 16 相机按钮：按一下开始 / 停止录像（设置里可关）
+    @Published var volumeKeyRecording = true
     /// 画面中间那个"圆圈十字架"水平仪，默认不显示（设置 → 拍摄辅助 里可以打开）
     @Published var showLevel = false
     /// 降噪：音频风噪抑制 + 画面暗光降噪，哪个系统支持就开哪个
@@ -436,6 +438,8 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var locationNote = ""
     /// 用户是否主动碰过水印（开过面板 / 勾过项）。启动预热不要在这种时候把定位停掉
     private var watermarkEngaged = false
+    /// 面板打开时"补数据"的节流时间戳
+    private var lastWatermarkRetry = Date.distantPast
 
     let session = AVCaptureSession()
     let level = LevelSensor()
@@ -988,14 +992,29 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    /// 焦段档位：0.5x / 1x / 2x 三档固定摆出来。
-    /// 本机没有超广角时 0.5x 会置灰不可点（见 isZoomChipAvailable）。
-    let zoomChips = ["0.5x", "1x", "2x"]
+    /// 焦段档位：本机有超广角才给三档，没有就只留广角 / 长焦，
+    /// 摆出来的一定点得动，不会出现灰着的 0.5x。
+    var zoomChips: [String] { ["0.5x", "1x", "2x"].filter { isZoomChipAvailable($0) } }
     /// 后置有没有超广角镜头（0.5x 靠它）。开机算一次就够，查设备不该每帧都跑。
     @Published var ultraWideAvailable = false
 
     func refreshLensAvailability() {
-        ultraWideAvailable = lensDevice(.ultraWide) != nil
+        // 后置超广角有两种存在形式：独立的一颗，或者藏在三摄/双广角虚拟设备里。
+        // 用 DiscoverySession 一起查，避免某些机型上单独取 .builtInUltraWideCamera 取不到，
+        // 结果"有超广角的机器也看不到 0.5x"。
+        let types: [AVCaptureDevice.DeviceType] = [.builtInUltraWideCamera,
+                                                   .builtInTripleCamera,
+                                                   .builtInDualWideCamera]
+        let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: types,
+                                                         mediaType: .video,
+                                                         position: .back)
+        if !discovery.devices.isEmpty {
+            ultraWideAvailable = true
+        } else {
+            ultraWideAvailable = AVCaptureDevice.default(.builtInUltraWideCamera,
+                                                         for: .video,
+                                                         position: .back) != nil
+        }
     }
 
     /// 这一档在当前机型/当前镜头上能不能用。0.5x 需要后置超广角，前置也做不了。
@@ -1430,7 +1449,17 @@ final class CameraEngine: NSObject, ObservableObject {
     /// 等用户勾上的那一刻数据已经在手里，不用再开关两次。
     func ensureWatermarkStarted() {
         watermarkEngaged = true
-        locator.start()
+        locator.requestRefresh()
+    }
+
+    /// 面板还开着、但地点 / 天气还没回来时，每隔几秒补一次 ——
+    /// 之前要"关掉再打开"才出数据，就是因为在跑的时候不会再取一次。
+    func refreshWatermarkIfNeeded() {
+        guard watermarkOn || watermarkEngaged, locationNote.isEmpty else { return }
+        guard watermarkData.place.isEmpty || !watermarkData.hasWeather else { return }
+        guard Date().timeIntervalSince(lastWatermarkRetry) > 4 else { return }
+        lastWatermarkRetry = Date()
+        locator.requestRefresh()
     }
 
     /// 勾选 / 取消某一项。勾选时顺手把总开关打开 —— 和参考 App 一样，点一下水印就出现。

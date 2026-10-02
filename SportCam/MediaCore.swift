@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import VideoToolbox
 import CoreMedia
+import CoreVideo
 
 // ============================================================
 //  媒体核心：日志 / sampleBuffer 工具 / H.264 编码器 / 提示音
@@ -365,7 +366,10 @@ final class SegmentRecorder {
         let time = presentationTime(sample)
         let isKey = sample.isSync
 
-        let needNew = (writer == nil) || (isKey && shouldRotate(at: time))
+        // 只有预录的"滚动缓存"需要切段（方便淘汰旧段）。
+        // 正式录制期间不再切段 —— 结束时只剩一个长文件，
+        // 合并时不用再打开几十上百个小分段，保存明显更快。
+        let needNew = (writer == nil) || (!clipMode && isKey && shouldRotate(at: time))
         if needNew {
             guard isKey else { return }
             finishCurrentSegment(intoClip: clipMode)
@@ -731,10 +735,15 @@ enum SegmentMerger {
         let videoComposition = watermark.flatMap { WatermarkComposition.make(asset: composition, config: $0) }
         var ok: Bool
         if let videoComposition = videoComposition {
-            // 叠了水印就没法走 Passthrough（系统会拒绝），只能重编码一次。
-            // 预设按源分辨率挑，别用 HighestQuality 把 720p 往上补。
-            ok = export(composition, videoComposition: videoComposition, to: output,
-                        preset: recodePreset(for: composition))
+            // 叠了水印没法走 Passthrough，只能重编码一次。
+            // 重编码先用自建管线（AVAssetReader + AVAssetWriter 硬件编码，不经
+            // AVAssetExportSession 的调度），明显更快；万一失败再退回老路，保证存得下来。
+            ok = fastRecode(composition, videoComposition: videoComposition, to: output)
+            if !ok {
+                Log.write("[合并] 自建管线失败，退回 AVAssetExportSession")
+                ok = export(composition, videoComposition: videoComposition, to: output,
+                            preset: recodePreset(for: composition))
+            }
         } else {
             ok = export(composition, videoComposition: nil, to: output,
                         preset: AVAssetExportPresetPassthrough)
@@ -752,6 +761,146 @@ enum SegmentMerger {
             Log.write("[合并] 成功 \(inserted)段 \(mark) 时长\(seconds)秒 用时\(usedMS)ms")
         }
         return ok
+    }
+
+    /// 烧水印时的重编码：自己拉 reader + writer（硬件 H.264），不经过 AVAssetExportSession。
+    /// 好处是编码器不排队、立刻全速跑，保存比原来快；音轨直接搬压缩样本，不二次编码。
+    /// 失败返回 false，由调用方退回 AVAssetExportSession。
+    private static func fastRecode(_ asset: AVAsset, videoComposition: AVVideoComposition, to output: URL) -> Bool {
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else { return false }
+        let audioTrack = asset.tracks(withMediaType: .audio).first
+        let renderSize = videoComposition.renderSize
+        guard renderSize.width > 8, renderSize.height > 8 else { return false }
+
+        try? FileManager.default.removeItem(at: output)
+        guard let reader = try? AVAssetReader(asset: asset) else { return false }
+
+        let videoOut = AVAssetReaderVideoCompositionOutput(
+            videoTracks: [videoTrack],
+            videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        videoOut.videoComposition = videoComposition
+        videoOut.alwaysCopiesSampleData = false
+        guard reader.canAdd(videoOut) else { return false }
+        reader.add(videoOut)
+
+        var audioOut: AVAssetReaderTrackOutput?
+        if let audioTrack = audioTrack {
+            // outputSettings 传 nil = 不解码，直接搬原始压缩样本（AAC 原样进新文件）
+            let out = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+            out.alwaysCopiesSampleData = false
+            if reader.canAdd(out) { reader.add(out); audioOut = out }
+        }
+
+        guard let writer = try? AVAssetWriter(outputURL: output, fileType: .mov) else { return false }
+
+        // 帧率跟着合成走；渲染尺寸就是输出尺寸，不再让预设二次缩放
+        let fps = (videoComposition.frameDuration.isValid && videoComposition.frameDuration.seconds > 0)
+            ? 1.0 / videoComposition.frameDuration.seconds : 30.0
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: Int(renderSize.width.rounded()),
+            AVVideoHeightKey: Int(renderSize.height.rounded()),
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: max(Int(renderSize.width * renderSize.height * 3), 6_000_000),
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoMaxKeyFrameIntervalDurationKey: 1,
+                AVVideoExpectedSourceFrameRateKey: Int(fps.rounded())
+            ]
+        ]
+        let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        videoIn.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: videoIn,
+            sourcePixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        guard writer.canAdd(videoIn) else { return false }
+        writer.add(videoIn)
+
+        var audioIn: AVAssetWriterInput?
+        if let audioOut = audioOut, let format = audioTrack?.formatDescriptions.first {
+            let input = AVAssetWriterInput(mediaType: .audio,
+                                           outputSettings: nil,
+                                           sourceFormatHint: format as! CMFormatDescription)
+            input.expectsMediaDataInRealTime = false
+            if writer.canAdd(input) { writer.add(input); audioIn = input }
+        }
+
+        guard writer.startWriting(), reader.startReading() else {
+            writer.cancelWriting()
+            reader.cancelReading()
+            try? FileManager.default.removeItem(at: output)
+            return false
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        let queue = DispatchQueue(label: "com.sportcam.recode")
+        let group = DispatchGroup()
+        let stateLock = NSLock()
+        var healthy = true
+
+        group.enter()
+        videoIn.requestMediaDataWhenReady(on: queue) {
+            while videoIn.isReadyForMoreMediaData {
+                guard let sample = videoOut.copyNextSampleBuffer() else {
+                    videoIn.markAsFinished()
+                    group.leave()
+                    return
+                }
+                let time = CMSampleBufferGetPresentationTimeStamp(sample)
+                if let buffer = CMSampleBufferGetImageBuffer(sample),
+                   adaptor.append(buffer, withPresentationTime: time) {
+                    continue
+                }
+                stateLock.lock(); healthy = false; stateLock.unlock()
+                videoIn.markAsFinished()
+                group.leave()
+                return
+            }
+        }
+
+        if let audioIn = audioIn, let audioOut = audioOut {
+            group.enter()
+            audioIn.requestMediaDataWhenReady(on: queue) {
+                while audioIn.isReadyForMoreMediaData {
+                    guard let sample = audioOut.copyNextSampleBuffer() else {
+                        audioIn.markAsFinished()
+                        group.leave()
+                        return
+                    }
+                    if audioIn.append(sample) { continue }
+                    stateLock.lock(); healthy = false; stateLock.unlock()
+                    audioIn.markAsFinished()
+                    group.leave()
+                    return
+                }
+            }
+        }
+
+        let done = DispatchSemaphore(value: 0)
+        var success = false
+        group.notify(queue: queue) {
+            stateLock.lock(); let healthyNow = healthy; stateLock.unlock()
+            if !healthyNow || reader.status == .failed {
+                writer.cancelWriting()
+                try? FileManager.default.removeItem(at: output)
+            } else {
+                let wait = DispatchSemaphore(value: 0)
+                writer.finishWriting { wait.signal() }
+                wait.wait()
+                success = writer.status == .completed
+                if !success { try? FileManager.default.removeItem(at: output) }
+            }
+            done.signal()
+        }
+        // 正常几秒到几十秒就完事；给足 10 分钟，真卡住了也不能把保存流程吊死
+        if done.wait(timeout: .now() + 600) == .timedOut {
+            reader.cancelReading()
+            writer.cancelWriting()
+            try? FileManager.default.removeItem(at: output)
+            Log.write("[合并] 自建管线超时，退回 AVAssetExportSession")
+            return false
+        }
+        reader.cancelReading()
+        return success
     }
 
     /// 重编码时按源分辨率挑预设。

@@ -139,7 +139,7 @@ private struct WatermarkPreview: View {
         let lines = engine.watermarkLines(at: now)
         // 和烧进视频的比例一致：字号按屏高算、整块宽度限制在屏宽 66%，
         // 地址长了会自己折行，不会甩出一条横贯全屏的长线。
-        let fontSize = max(UIScreen.main.bounds.height * 0.024, 12)
+        let fontSize = max(UIScreen.main.bounds.height * 0.0175, 11)
         let maxWidth = UIScreen.main.bounds.width * 0.66
 
         return VStack(alignment: .leading, spacing: fontSize * 0.26) {
@@ -161,21 +161,28 @@ private struct WatermarkPreview: View {
     }
 }
 
+/// 构图网格：三分线。
+/// 用 1 物理像素的实线 + 很淡的白，取景器那种细线；不用虚线（虚线太像演示稿，
+/// 亮场景下反而更抢眼）。线外压一层极淡暗影，白墙上也看得见。
 private struct GridOverlay: View {
     var body: some View {
         GeometryReader { geo in
+            let hairline = 1 / UIScreen.main.scale
             Path { path in
                 for index in 1..<3 {
-                    let x = geo.size.width * CGFloat(index) / 3
+                    let x = (geo.size.width * CGFloat(index) / 3).rounded()
                     path.move(to: CGPoint(x: x, y: 0))
                     path.addLine(to: CGPoint(x: x, y: geo.size.height))
-                    let y = geo.size.height * CGFloat(index) / 3
+
+                    let y = (geo.size.height * CGFloat(index) / 3).rounded()
                     path.move(to: CGPoint(x: 0, y: y))
                     path.addLine(to: CGPoint(x: geo.size.width, y: y))
                 }
             }
-            .stroke(Color.white.opacity(0.28), style: StrokeStyle(lineWidth: 0.5, dash: [4, 4]))
+            .stroke(Color.white.opacity(0.22), lineWidth: hairline)
+            .shadow(color: .black.opacity(0.20), radius: 0.5)
         }
+        .allowsHitTesting(false)
     }
 }
 
@@ -286,6 +293,8 @@ struct CameraScreen: View {
     @State private var pinching = false
     @State private var zoomBase: CGFloat = 1.0
     @State private var focusReticle: CGPoint?
+    /// 水印面板打开时每秒推一下：时间行会走字，定位/天气晚回来也能立刻显示
+    private let panelTick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ZStack {
@@ -294,7 +303,10 @@ struct CameraScreen: View {
             CameraPreview(session: engine.session,
                           orientation: engine.videoOrientation,
                           mirrored: engine.cameraPosition == .front,
-                          onCaptureButton: { engine.toggleRecording() },
+                          onCaptureButton: {
+                              // 音量键 / iPhone 16 相机按钮 → 切换录制（设置里可关）
+                              if engine.volumeKeyRecording { engine.toggleRecording() }
+                          },
                           onFocusPoint: { devicePoint, layerPoint in
                               engine.focus(atDevicePoint: devicePoint)
                               withAnimation(.easeOut(duration: 0.12)) { focusReticle = layerPoint }
@@ -767,6 +779,8 @@ struct CameraScreen: View {
         .frame(maxWidth: 340)
         .background(Color(red: 0.15, green: 0.15, blue: 0.16))
         .cornerRadius(16)
+        // 面板开着时每秒推一次：时间会走字，定位/天气晚回来也能马上填上
+        .onReceive(panelTick) { _ in engine.refreshWatermarkIfNeeded() }
     }
 
     private func watermarkMaster(_ title: String, on: Bool, action: @escaping () -> Void) -> some View {
@@ -845,13 +859,12 @@ struct CameraScreen: View {
 
     private var zoomPill: some View {
         HStack(spacing: 4) {
-            // 三档固定摆出来；本机没有超广角时 0.5x 置灰不可点
+            // 档位已按机型过滤：没有超广角就只给广角 / 长焦，不会摆出点不动的档
             ForEach(engine.zoomChips, id: \.self) { chip in
                 ZoomChip(label: chip, selected: engine.isZoomChipSelected(chip)) {
                     engine.selectZoomChip(chip)
                 }
-                .disabled(engine.isRecording || !engine.isZoomChipAvailable(chip))
-                .opacity(engine.isZoomChipAvailable(chip) ? 1 : 0.35)
+                .disabled(engine.isRecording)
             }
         }
         .padding(4)
@@ -1092,15 +1105,12 @@ struct SettingsSheet: View {
     @State private var startInput = ""
     @State private var stopInput = ""
     @State private var words: (start: [String], stop: [String]) = ([], [])
+    /// 设置页打开时每秒推一次，定位/天气晚回来也能立刻填上
+    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("显示"),
-                        footer: Text("左上角那个「剩余空间 / 可录时长」的胶囊。不想看就关掉，界面更干净。")) {
-                    Toggle("显示剩余空间", isOn: $engine.showStorage)
-                }
-
                 Section(header: Text("画面")) {
                     Picker("分辨率", selection: $engine.quality) {
                         ForEach(VideoQuality.allCases) { Text($0.rawValue).tag($0) }
@@ -1194,6 +1204,16 @@ struct SettingsSheet: View {
                     Toggle("水平仪", isOn: $engine.showLevel)
                     Toggle("录制提示音", isOn: $engine.beepOn)
                 }
+
+                Section(header: Text("按键"),
+                        footer: Text("开启后，按音量键（或 iPhone 16 的相机按钮）即可开始 / 停止录像。")) {
+                    Toggle("音量键控制录像", isOn: $engine.volumeKeyRecording)
+                }
+
+                Section(header: Text("显示"),
+                        footer: Text("左上角那个「剩余空间 / 可录时长」的胶囊。默认关闭，想看再打开。")) {
+                    Toggle("显示剩余空间", isOn: $engine.showStorage)
+                }
             }
             .navigationBarTitle("设置", displayMode: .inline)
             .navigationBarItems(trailing: Button("完成") { presentation.wrappedValue.dismiss() })
@@ -1206,5 +1226,6 @@ struct SettingsSheet: View {
         .onDisappear {
             engine.setVoiceWords(start: words.start, stop: words.stop)
         }
+        .onReceive(tick) { _ in engine.refreshWatermarkIfNeeded() }
     }
 }
