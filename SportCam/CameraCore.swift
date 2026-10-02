@@ -434,6 +434,8 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var watermarkData = WatermarkData()
     /// 定位异常提示（只在设置页显示，不会写进视频）
     @Published var locationNote = ""
+    /// 用户是否主动碰过水印（开过面板 / 勾过项）。启动预热不要在这种时候把定位停掉
+    private var watermarkEngaged = false
 
     let session = AVCaptureSession()
     let level = LevelSensor()
@@ -1009,12 +1011,13 @@ final class CameraEngine: NSObject, ObservableObject {
 
     /// 已经授权过定位的话，启动时先悄悄取一次位置。
     /// 这样用户点开水印面板时地名已经在手里，不会出现"要点两次才出来"。
-    /// 30 秒内没开水印就停掉，不留后台定位。
+    /// 30 秒内没碰过水印就停掉，不留后台定位。
     private func prewarmLocation() {
         guard locator.isAuthorized else { return }
+        watermarkEngaged = false
         locator.start()
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-            guard let self = self, !self.watermarkOn else { return }
+            guard let self = self, !self.watermarkOn, !self.watermarkEngaged else { return }
             self.locator.stop()
         }
     }
@@ -1426,6 +1429,7 @@ final class CameraEngine: NSObject, ObservableObject {
     /// 点开「水印时间」面板、或勾选任意一项时都会调 —— 目的是提前把定位跑起来，
     /// 等用户勾上的那一刻数据已经在手里，不用再开关两次。
     func ensureWatermarkStarted() {
+        watermarkEngaged = true
         locator.start()
     }
 

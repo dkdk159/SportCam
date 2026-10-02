@@ -137,17 +137,22 @@ private struct WatermarkPreview: View {
 
     var body: some View {
         let lines = engine.watermarkLines(at: now)
-        return VStack(alignment: .leading, spacing: 1) {
+        // 和烧进视频的比例一致：字号按屏高算、整块宽度限制在屏宽 66%，
+        // 地址长了会自己折行，不会甩出一条横贯全屏的长线。
+        let fontSize = max(UIScreen.main.bounds.height * 0.024, 12)
+        let maxWidth = UIScreen.main.bounds.width * 0.66
+
+        return VStack(alignment: .leading, spacing: fontSize * 0.26) {
             ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
                 Text(line)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        // 和烧进视频的一致：不铺黑底，白字 + 阴影，画面干净
-        .font(.system(size: 12, weight: .semibold))
+        .font(.system(size: fontSize, weight: .semibold))
+        .frame(width: maxWidth, alignment: .leading)
+        // 和烧进视频的一致：不铺黑底，白字 + 描边阴影，画面干净
         .foregroundColor(.white)
-        .shadow(color: .black.opacity(0.9), radius: 2.5, x: 0, y: 0.5)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
+        .shadow(color: .black.opacity(0.9), radius: fontSize * 0.16, x: 0, y: 0.5)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
         .padding(.leading, 12)
         .padding(.bottom, bottomInset)

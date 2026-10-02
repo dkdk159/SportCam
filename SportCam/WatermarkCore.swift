@@ -57,7 +57,7 @@ enum WatermarkComposer {
     static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "zh_CN")
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        f.dateFormat = "yyyy.MM.dd HH:mm"      // 不读秒，和参考 App 一致
         return f
     }()
 
@@ -191,7 +191,9 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         let text = store.string(forKey: LocationProvider.placeKey) ?? ""
         guard !text.isEmpty else { return nil }
         let when = store.object(forKey: LocationProvider.placeTimeKey) as? Date ?? .distantPast
-        guard abs(when.timeIntervalSinceNow) < 6 * 3600 else { return nil }
+        // 放宽到 24 小时：绝大多数时候人还在同一个地方，先顶上去再让新定位纠正，
+        // 这样点开水印是"秒出"而不是干等定位。
+        guard abs(when.timeIntervalSinceNow) < 24 * 3600 else { return nil }
         return text
     }
 
@@ -269,31 +271,30 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         DispatchQueue.main.async { self.onFailure?("定位失败") }
     }
 
-    /// 拼地名：省 + 市 + 区 + 街道（含门牌）+ 具体地点。
-    /// 反查结果里 thoroughfare / name 才是"具体地方"，只取到区会看不清是在哪。
+    /// 拼地名：市 + 区 + 街道（含门牌）+ 具体地点。
+    /// 不写省名（太长），而且 name 通常已经含街道了就不再重复拼一遍 ——
+    /// 参考 App 的地址也是这个长度，字少一半、水印块更整齐。
     private static func describe(_ mark: CLPlacemark) -> String {
-        var core: [String] = []
-        func addCore(_ raw: String?) {
-            guard let s = raw?.trimmingCharacters(in: .whitespaces), !s.isEmpty, !core.contains(s) else { return }
-            core.append(s)
-        }
-        addCore(mark.administrativeArea)   // 省 / 直辖市
-        addCore(mark.locality)             // 市
-        addCore(mark.subLocality)          // 区
-
-        // 街道 + 门牌号
-        if let road = mark.thoroughfare?.trimmingCharacters(in: .whitespaces), !road.isEmpty {
-            addCore(road + (mark.subThoroughfare ?? ""))
+        var parts: [String] = []
+        func add(_ raw: String?) {
+            guard let s = raw?.trimmingCharacters(in: .whitespaces), !s.isEmpty, !parts.contains(s) else { return }
+            parts.append(s)
         }
 
-        var text = core.joined()
-        // name 一般就是最近的 POI / 具体地点；和已有内容重复就不再加
-        if let name = mark.name?.trimmingCharacters(in: .whitespaces), !name.isEmpty,
-           !text.contains(name), !name.contains(text) {
-            text += name
+        add(mark.locality ?? mark.administrativeArea)   // 市（直辖市时就是市名）
+        add(mark.subLocality)                           // 区
+
+        let name = mark.name?.trimmingCharacters(in: .whitespaces) ?? ""
+        let road = mark.thoroughfare?.trimmingCharacters(in: .whitespaces) ?? ""
+        if !name.isEmpty, !road.isEmpty, name.contains(road) {
+            add(name)                                   // name 已含街道：只写 name
+        } else {
+            add(road.isEmpty ? nil : road + (mark.subThoroughfare ?? ""))
+            add(name)
         }
-        if text.isEmpty { text = mark.country ?? "" }
-        return text
+
+        if parts.isEmpty { add(mark.country) }
+        return parts.joined()
     }
 }
 
@@ -426,8 +427,11 @@ final class WatermarkRenderer {
     private func render(lines: [String]) -> UIImage? {
         guard size.width > 8, size.height > 8 else { return nil }
 
-        let fontSize = max(size.height * 0.029, 18)
+        let fontSize = max(size.height * 0.024, 15)
         let margin = size.width * 0.035
+        // 整块限制在屏宽的 66% 以内：地址长就自己折行，不会甩出一条横贯全屏的长线
+        let maxWidth = size.width * 0.66
+        let gap = fontSize * 0.26
 
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1                              // 尺寸即像素，和视频一一对应
@@ -437,7 +441,7 @@ final class WatermarkRenderer {
         return canvas.image { _ in
             let paragraph = NSMutableParagraphStyle()
             paragraph.alignment = .left
-            paragraph.lineSpacing = fontSize * 0.3
+            paragraph.lineSpacing = fontSize * 0.2
 
             // 参考 App 的写法：不铺黑底，只用「白字 + 细黑描边 + 淡阴影」，
             // 亮天空下照样看得清，画面也干净。
@@ -455,20 +459,23 @@ final class WatermarkRenderer {
                 .shadow: shadow
             ]
 
-            let text = lines.joined(separator: "\n") as NSString
-            let maxTextWidth = size.width - margin * 2
-            let textBounds = text.boundingRect(with: CGSize(width: maxTextWidth, height: .greatestFiniteMagnitude),
-                                               options: [.usesLineFragmentOrigin, .usesFontLeading],
-                                               attributes: attrs,
-                                               context: nil)
+            // 先量出每一行（含折行后）的高度，再整块从底部往上排
+            let heights: [CGFloat] = lines.map { line in
+                ceil((line as NSString).boundingRect(with: CGSize(width: maxWidth, height: .greatestFiniteMagnitude),
+                                                     options: [.usesLineFragmentOrigin, .usesFontLeading],
+                                                     attributes: attrs,
+                                                     context: nil).height)
+            }
+            let total = heights.reduce(0, +) + gap * CGFloat(max(lines.count - 1, 0))
 
-            text.draw(with: CGRect(x: margin,
-                                   y: size.height - margin - ceil(textBounds.height),
-                                   width: maxTextWidth,
-                                   height: ceil(textBounds.height)),
-                      options: [.usesLineFragmentOrigin, .usesFontLeading],
-                      attributes: attrs,
-                      context: nil)
+            var y = size.height - margin - total
+            for (index, line) in lines.enumerated() {
+                (line as NSString).draw(with: CGRect(x: margin, y: y, width: maxWidth, height: heights[index]),
+                                        options: [.usesLineFragmentOrigin, .usesFontLeading],
+                                        attributes: attrs,
+                                        context: nil)
+                y += heights[index] + gap
+            }
         }
     }
 }
