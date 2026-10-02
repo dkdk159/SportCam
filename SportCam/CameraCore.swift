@@ -772,7 +772,7 @@ final class CameraEngine: NSObject, ObservableObject {
                     try? FileManager.default.removeItem(at: output)
                     DispatchQueue.main.async {
                         self.isBusy = false
-                        self.message(saved ? "已保存到相册 · 共\(clip.segments.count)段" : "保存相册失败（检查相册权限）")
+                        self.message(saved ? "保存成功" : "保存相册失败（检查相册权限）")
                     }
                 }
             }
