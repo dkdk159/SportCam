@@ -94,15 +94,31 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         DispatchQueue.main.async { self.onFailure?("定位失败") }
     }
 
-    /// 拼一个短地名：省 + 市 + 区；都拿不到就用具体地点名。
+    /// 拼地名：省 + 市 + 区 + 街道（含门牌）+ 具体地点。
+    /// 反查结果里 thoroughfare / name 才是"具体地方"，只取到区会看不清是在哪。
     private static func describe(_ mark: CLPlacemark) -> String {
-        var parts: [String] = []
-        for raw in [mark.administrativeArea, mark.locality, mark.subLocality] {
-            guard let s = raw, !s.isEmpty, !parts.contains(s) else { continue }
-            parts.append(s)
+        var core: [String] = []
+        func addCore(_ raw: String?) {
+            guard let s = raw?.trimmingCharacters(in: .whitespaces), !s.isEmpty, !core.contains(s) else { return }
+            core.append(s)
         }
-        if parts.isEmpty, let name = mark.name, !name.isEmpty { parts.append(name) }
-        return parts.joined()
+        addCore(mark.administrativeArea)   // 省 / 直辖市
+        addCore(mark.locality)             // 市
+        addCore(mark.subLocality)          // 区
+
+        // 街道 + 门牌号
+        if let road = mark.thoroughfare?.trimmingCharacters(in: .whitespaces), !road.isEmpty {
+            addCore(road + (mark.subThoroughfare ?? ""))
+        }
+
+        var text = core.joined()
+        // name 一般就是最近的 POI / 具体地点；和已有内容重复就不再加
+        if let name = mark.name?.trimmingCharacters(in: .whitespaces), !name.isEmpty,
+           !text.contains(name), !name.contains(text) {
+            text += name
+        }
+        if text.isEmpty { text = mark.country ?? "" }
+        return text
     }
 }
 
