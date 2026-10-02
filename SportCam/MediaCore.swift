@@ -634,32 +634,25 @@ struct RecordedClip {
 
 /// 把一次录制的素材合成一个完整文件。
 ///
-/// 无缝的关键：
-/// 1) 视频分段都出自同一条采集时间轴，每段记录了自己的起点。
-///    合并时统一映射回采集时间轴、再整体平移一次 —— 不做"逐段重新对齐"，
-///    段与段之间自然零间隙、零重叠。
-/// 2) 音频本来就是**一整条连续音轨**（录音期间只有一个 AAC 编码器、中途不重启），
-///    合并时按时间范围裁一段直接搬进容器即可 —— 不存在任何接缝，
-///    也就不会有"每 2 秒一次的滋滋声"。
+/// 做法对齐参考 App（钓鱼相机 jj.dyxj）的源码写法：
+///   1) AVMutableComposition 按时间先后把每个分段 insertTimeRange 首尾相接；
+///   2) 音频是一条连续音轨，按本次录制的时间窗整段插入一次；
+///   3) AVAssetExportSession(presetName: Passthrough) 直接导出 —— 不重新编码，
+///      画质音质都没有二次损失。
+///   脱壳出来的二进制里用的正是这一组 API：
+///   addMutableTrackWithMediaType: / insertTimeRange:ofTrack:atTime:error: /
+///   initWithAsset:presetName: / setOutputFileType: / setShouldOptimizeForNetworkUse: /
+///   exportAsynchronouslyWithCompletionHandler:
 enum SegmentMerger {
     static func merge(_ clip: RecordedClip, to output: URL, completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            var ok = concat(clip, to: output)
-            if !ok {
-                Log.write("[合并] 逐帧合并未成功，改用拼接方式重试")
-                ok = fallback(clip, to: output)
-            }
+            let ok = compose(clip, to: output)
             DispatchQueue.main.async { completion(ok) }
         }
     }
 
-    /// 已按输出时间轴裁剪好的音轨：格式 + (样本, 输出起点) 列表
-    private struct PreparedAudio {
-        let format: CMFormatDescription?
-        let samples: [(sample: CMSampleBuffer, out: CMTime)]
-    }
-
-    private static func concat(_ clip: RecordedClip, to output: URL) -> Bool {
+    /// 合成：分段首尾相接 + 连续音轨整段插入，然后无损导出。
+    private static func compose(_ clip: RecordedClip, to output: URL) -> Bool {
         let valid = clip.segments
             .filter { FileManager.default.fileExists(atPath: $0.url.path) && $0.start.isValid }
             .sorted { CMTimeCompare($0.start, $1.start) < 0 }
@@ -668,175 +661,9 @@ enum SegmentMerger {
             return false
         }
 
-        // 视频格式取第一个读得动的段；origin = 本次录制的起点，输出时间轴从这里归零
-        var videoFormat: CMFormatDescription?
-        var origin = valid[0].start
-        for seg in valid {
-            let probe = AVURLAsset(url: seg.url)
-            if let head = readSamples(probe, media: .video, quiet: true).first,
-               let format = CMSampleBufferGetFormatDescription(head) {
-                videoFormat = format
-                origin = seg.start
-                break
-            }
-            Log.write("[合并] 跳过读不动的分段 \(seg.url.lastPathComponent)")
-        }
-        guard let hint = videoFormat else {
-            Log.write("[合并] 所有分段都读不到视频格式")
-            return false
-        }
-
-        // 本次录制在采集时间轴上的结束位置（用来裁剪连续音轨）
-        var clipEnd = valid[0].start
-        for seg in valid {
-            let end = CMTimeAdd(seg.start, CMTime(seconds: seg.seconds, preferredTimescale: 600))
-            if CMTimeCompare(end, clipEnd) > 0 { clipEnd = end }
-        }
-
-        let prepared = prepareAudio(clip.audio, origin: origin, clipEnd: clipEnd)
-
-        try? FileManager.default.removeItem(at: output)
-        guard let writer = try? AVAssetWriter(outputURL: output, fileType: .mp4) else {
-            Log.write("[合并] 创建写入器失败")
-            return false
-        }
-        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: hint)
-        videoInput.expectsMediaDataInRealTime = false
-        guard writer.canAdd(videoInput) else {
-            Log.write("[合并] 无法添加视频轨")
-            return false
-        }
-        writer.add(videoInput)
-
-        // 音轨已经是单个连续 AAC 流，直接原样搬进容器（不重编码、不拼接）
-        var audioInput: AVAssetWriterInput?
-        if let prepared = prepared, let format = prepared.format {
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: format)
-            input.expectsMediaDataInRealTime = false
-            if writer.canAdd(input) {
-                writer.add(input)
-                audioInput = input
-            }
-        }
-
-        guard writer.startWriting() else {
-            Log.write("[合并] startWriting 失败 \(writer.error?.localizedDescription ?? "")")
-            return false
-        }
-        writer.startSession(atSourceTime: .zero)
-
-        let began = Date()
-        var videoCount = 0
-        var audioCount = 0
-        var lastVideoOut = CMTime.invalid
-        var audioIndex = 0
-
-        for seg in valid {
-            let asset = AVURLAsset(url: seg.url)
-            let anchor = seg.start
-            let videos = readSamples(asset, media: .video)
-            guard let head = videos.first else { continue }
-            let base = presentationTime(head)
-
-            // ---- 视频：无损搬运，统一映射回采集时间轴后再整体平移 ----
-            for sample in videos {
-                let out = CMTimeSubtract(CMTimeAdd(anchor, CMTimeSubtract(presentationTime(sample), base)), origin)
-                guard out.isValid, CMTimeCompare(out, .zero) >= 0 else { continue }
-                if lastVideoOut.isValid && CMTimeCompare(out, lastVideoOut) <= 0 { continue }
-                guard let retimed = retime(sample, to: out) else { continue }
-                waitReady(videoInput)
-                if videoInput.append(retimed) {
-                    lastVideoOut = out
-                    videoCount += 1
-                }
-            }
-
-            // ---- 音轨：按本段的时间窗把已经排好的连续音轨推进过去，保证与视频交错写入 ----
-            guard let aIn = audioInput, let prepared = prepared else { continue }
-            let windowEnd = CMTimeSubtract(
-                CMTimeAdd(anchor, CMTime(seconds: seg.seconds, preferredTimescale: 600)), origin)
-            while audioIndex < prepared.samples.count {
-                let item = prepared.samples[audioIndex]
-                if CMTimeCompare(item.out, windowEnd) >= 0 { break }
-                waitReady(aIn)
-                if aIn.append(item.sample) { audioCount += 1 }
-                audioIndex += 1
-            }
-        }
-        // 补齐剩余音轨
-        if let aIn = audioInput, let prepared = prepared {
-            while audioIndex < prepared.samples.count {
-                waitReady(aIn)
-                if aIn.append(prepared.samples[audioIndex].sample) { audioCount += 1 }
-                audioIndex += 1
-            }
-        }
-
-        guard videoCount > 0 else {
-            Log.write("[合并] 没有可写入的视频样本")
-            writer.cancelWriting()
-            return false
-        }
-
-        videoInput.markAsFinished()
-        audioInput?.markAsFinished()
-        let done = DispatchSemaphore(value: 0)
-        writer.finishWriting { done.signal() }
-        done.wait()
-
-        let ok = writer.status == .completed
-        let usedMS = Int(Date().timeIntervalSince(began) * 1000)
-        if ok {
-            let seconds = String(format: "%.1f", CMTimeGetSeconds(lastVideoOut))
-            Log.write("[合并] 成功 \(valid.count)段 v=\(videoCount) a=\(audioCount) 时长\(seconds)秒 用时\(usedMS)ms")
-        } else {
-            Log.write("[合并] 失败 status=\(writer.status.rawValue) \(writer.error?.localizedDescription ?? "")")
-        }
-        return ok
-    }
-
-    /// 把连续音轨裁剪到本次录制的范围，并把每帧换算到输出时间轴（origin 归零）。
-    private static func prepareAudio(_ audio: RecordedAudio?, origin: CMTime, clipEnd: CMTime) -> PreparedAudio? {
-        guard let audio = audio, FileManager.default.fileExists(atPath: audio.url.path) else { return nil }
-        let asset = AVURLAsset(url: audio.url)
-        guard let track = asset.tracks(withMediaType: .audio).first else {
-            Log.write("[合并] 读不到连续音轨")
-            return nil
-        }
-        // 音轨文件自己时间轴上的基准（读回来的样本 PTS 也在这个时间轴上）
-        let base = track.timeRange.start
-        let duration = CMTimeSubtract(clipEnd, origin)
-        guard CMTimeCompare(duration, .zero) > 0 else { return nil }
-        // 采集时间轴 → 音轨文件时间轴：origin 对应 anchor
-        let srcStart = CMTimeMaximum(CMTimeAdd(base, CMTimeSubtract(origin, audio.anchor)), base)
-
-        let samples = readSamples(asset, media: .audio, quiet: true,
-                                  range: CMTimeRange(start: srcStart, duration: duration))
-        guard let first = samples.first,
-              let format = CMSampleBufferGetFormatDescription(first) else {
-            Log.write("[合并] 连续音轨里没有可用样本")
-            return nil
-        }
-
-        var out: [(sample: CMSampleBuffer, out: CMTime)] = []
-        for sample in samples {
-            let t = CMTimeSubtract(CMTimeAdd(audio.anchor, CMTimeSubtract(presentationTime(sample), base)), origin)
-            if CMTimeCompare(t, .zero) < 0 { continue }
-            if CMTimeCompare(t, duration) > 0 { break }
-            out.append((sample: sample, out: t))
-        }
-        Log.write("[合并] 音轨 \(out.count) 帧 裁到\(String(format: "%.1f", CMTimeGetSeconds(duration)))秒")
-        return PreparedAudio(format: format, samples: out)
-    }
-
-    /// 兜底：用 AVMutableComposition + passthrough 拼接。
-    private static func fallback(_ clip: RecordedClip, to output: URL) -> Bool {
-        let valid = clip.segments
-            .filter { FileManager.default.fileExists(atPath: $0.url.path) && $0.start.isValid }
-            .sorted { CMTimeCompare($0.start, $1.start) < 0 }
-        guard !valid.isEmpty else { return false }
-
-        var clipEnd = valid[0].start
+        // origin = 本次录制的起点，clipEnd = 结束点；输出时间轴从 0 开始
+        let origin = valid[0].start
+        var clipEnd = origin
         for seg in valid {
             let end = CMTimeAdd(seg.start, CMTime(seconds: seg.seconds, preferredTimescale: 600))
             if CMTimeCompare(end, clipEnd) > 0 { clipEnd = end }
@@ -847,109 +674,75 @@ enum SegmentMerger {
                                                      preferredTrackID: kCMPersistentTrackID_Invalid)
         var cursor = CMTime.zero
         var inserted = 0
-
         for seg in valid {
             let asset = AVURLAsset(url: seg.url)
             guard let track = asset.tracks(withMediaType: .video).first else { continue }
-            let range = CMTimeRange(start: track.timeRange.start, duration: track.timeRange.duration)
+            let range = track.timeRange
             guard range.duration.isValid, CMTimeCompare(range.duration, .zero) > 0 else { continue }
             do {
                 try videoTrack?.insertTimeRange(range, of: track, at: cursor)
-                inserted += 1
                 cursor = CMTimeAdd(cursor, range.duration)
+                inserted += 1
             } catch {
-                Log.write("[合并] 拼接失败 \(error.localizedDescription)")
+                Log.write("[合并] 分段插入失败 \(seg.url.lastPathComponent)")
             }
         }
+        guard inserted > 0 else {
+            Log.write("[合并] 没有可用的视频轨")
+            return false
+        }
 
-        // 连续音轨：本身就是一条流，按录制范围整段插一次即可
-        if let audio = clip.audio,
+        // 音频：整条连续音轨，把 [origin, clipEnd] 这一段插到开头
+        if let audio = clip.audio, FileManager.default.fileExists(atPath: audio.url.path),
            let audioTrack = composition.addMutableTrack(withMediaType: .audio,
                                                         preferredTrackID: kCMPersistentTrackID_Invalid) {
             let asset = AVURLAsset(url: audio.url)
             if let track = asset.tracks(withMediaType: .audio).first {
-                let srcStart = CMTimeAdd(track.timeRange.start,
-                                         CMTimeSubtract(valid[0].start, audio.anchor))
-                let srcDuration = CMTimeSubtract(clipEnd, valid[0].start)
+                let base = track.timeRange.start
+                // 采集时间轴 → 音轨文件时间轴：origin 对应 anchor
+                let srcStart = CMTimeMaximum(CMTimeAdd(base, CMTimeSubtract(origin, audio.anchor)), base)
+                let srcDuration = CMTimeSubtract(clipEnd, origin)
                 if CMTimeCompare(srcDuration, .zero) > 0 {
-                    try? audioTrack.insertTimeRange(CMTimeRange(start: srcStart, duration: srcDuration),
-                                                    of: track, at: .zero)
+                    do {
+                        try audioTrack.insertTimeRange(CMTimeRange(start: srcStart, duration: srcDuration),
+                                                       of: track, at: .zero)
+                    } catch {
+                        Log.write("[合并] 音轨插入失败 \(error.localizedDescription)")
+                    }
                 }
             }
         }
 
-        guard inserted > 0,
-              let exporter = AVAssetExportSession(asset: composition,
-                                                  presetName: AVAssetExportPresetPassthrough) else {
-            return false
+        let began = Date()
+        var ok = export(composition, to: output, preset: AVAssetExportPresetPassthrough)
+        if !ok {
+            // 分段格式万一不一致，Passthrough 会拒；退回最高画质重编码一次
+            Log.write("[合并] 无损导出失败，改用 HighestQuality 重试")
+            ok = export(composition, to: output, preset: AVAssetExportPresetHighestQuality)
         }
-        try? FileManager.default.removeItem(at: output)
-        exporter.outputURL = output
-        exporter.outputFileType = .mp4
-        let done = DispatchSemaphore(value: 0)
-        exporter.exportAsynchronously { done.signal() }
-        done.wait()
-        let ok = exporter.status == .completed
+        let usedMS = Int(Date().timeIntervalSince(began) * 1000)
         if ok {
-            Log.write("[合并] 拼接方式成功 \(inserted)段")
-        } else {
-            Log.write("[合并] 拼接方式失败 status=\(exporter.status.rawValue) \(exporter.error?.localizedDescription ?? "")")
+            let seconds = String(format: "%.1f", CMTimeGetSeconds(composition.duration))
+            Log.write("[合并] 成功 \(inserted)段 时长\(seconds)秒 用时\(usedMS)ms")
         }
         return ok
     }
 
-    private static func readSamples(_ asset: AVURLAsset, media: AVMediaType,
-                                    quiet: Bool = false, range: CMTimeRange? = nil) -> [CMSampleBuffer] {
-        guard let track = asset.tracks(withMediaType: media).first else {
-            if !quiet { Log.write("[合并] 该段没有 \(media.rawValue) 轨道") }
-            return []
+    /// 导出。参考 App 用的就是 .mov + shouldOptimizeForNetworkUse。
+    private static func export(_ composition: AVAsset, to output: URL, preset: String) -> Bool {
+        guard let exporter = AVAssetExportSession(asset: composition, presetName: preset) else {
+            Log.write("[合并] 无法创建导出会话 preset=\(preset)")
+            return false
         }
-        guard let reader = try? AVAssetReader(asset: asset) else {
-            if !quiet { Log.write("[合并] 创建读取器失败") }
-            return []
-        }
-        if let range = range, range.duration.isValid, CMTimeCompare(range.duration, .zero) > 0 {
-            // 只读需要的区间，避免把很长的音轨整条读进内存
-            reader.timeRange = range
-        }
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-        output.alwaysCopiesSampleData = true
-        guard reader.canAdd(output) else {
-            if !quiet { Log.write("[合并] 无法挂载读取输出") }
-            return []
-        }
-        reader.add(output)
-        guard reader.startReading() else {
-            if !quiet { Log.write("[合并] 开始读取失败 status=\(reader.status.rawValue) \(reader.error?.localizedDescription ?? "")") }
-            return []
-        }
-        var samples: [CMSampleBuffer] = []
-        while let sample = output.copyNextSampleBuffer() { samples.append(sample) }
-        if samples.isEmpty && !quiet {
-            Log.write("[合并] 该段读不到样本 status=\(reader.status.rawValue) \(reader.error?.localizedDescription ?? "")")
-        }
-        reader.cancelReading()
-        return samples
-    }
-
-    private static func retime(_ sample: CMSampleBuffer, to time: CMTime) -> CMSampleBuffer? {
-        var timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(sample),
-                                        presentationTimeStamp: time,
-                                        decodeTimeStamp: .invalid)
-        var output: CMSampleBuffer?
-        let status = CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
-                                                           sampleBuffer: sample,
-                                                           sampleTimingEntryCount: 1,
-                                                           sampleTimingArray: &timing,
-                                                           sampleBufferOut: &output)
-        return status == noErr ? output : nil
-    }
-
-    private static func waitReady(_ input: AVAssetWriterInput) {
-        var spins = 0
-        while !input.isReadyForMoreMediaData && spins < 3000 {
-            Thread.sleep(forTimeInterval: 0.002)
-            spins += 1
-        }
+        try? FileManager.default.removeItem(at: output)
+        exporter.outputURL = output
+        exporter.outputFileType = .mov
+        exporter.shouldOptimizeForNetworkUse = true
+        let done = DispatchSemaphore(value: 0)
+        exporter.exportAsynchronously { done.signal() }
+        done.wait()
+        if exporter.status == .completed { return true }
+        Log.write("[合并] 导出失败 preset=\(preset) status=\(exporter.status.rawValue) \(exporter.error?.localizedDescription ?? "")")
+        return false
     }
 }

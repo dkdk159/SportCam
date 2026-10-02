@@ -1158,7 +1158,7 @@ final class CameraEngine: NSObject, ObservableObject {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd_HHmmss"
         clipIndex += 1
-        return folder.appendingPathComponent("SportCam_\(formatter.string(from: Date()))_\(clipIndex).mp4")
+        return folder.appendingPathComponent("SportCam_\(formatter.string(from: Date()))_\(clipIndex).mov")
     }
 
     // MARK: 看门狗
