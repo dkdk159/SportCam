@@ -911,8 +911,13 @@ final class CameraEngine: NSObject, ObservableObject {
             if !connection.isEnabled { connection.isEnabled = true }
             if connection.isVideoOrientationSupported { connection.videoOrientation = videoOrientation }
             if connection.isVideoMirroringSupported {
+                // 「所见即所录」：录制输出的镜像开关必须跟取景器一致。
+                // 取景器里前置是镜像的（举右手，画面里也在右边，跟照镜子一样），
+                // 以前这里固定 false，等于把录出来的画面又翻回另一边 —— 用户回放时
+                // 看到的就是"跟刚才取景器里左右反了"。这里跟预览用同一个判据。
+                let mirror = cameraDevice?.position == .front
                 connection.automaticallyAdjustsVideoMirroring = false
-                connection.isVideoMirrored = false
+                connection.isVideoMirrored = mirror
             }
             if connection.isVideoStabilizationSupported {
                 connection.preferredVideoStabilizationMode = antiShake.mode
