@@ -81,55 +81,23 @@ extension CMSampleBuffer {
         return !(first[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
     }
 
-    /// 深拷贝：生成拥有独立内存的副本。
+    /// 保留拷贝：用于把 sampleBuffer 带到回调之外（存进预录缓冲、交给写入器）。
     ///
-    /// 【这条是预录能否工作的命门】
-    /// 采集/编码回调只要一返回，原始 sampleBuffer 内部的内存就会被系统回收。
-    /// 如果我们把原对象塞进预录缓冲、几秒甚至几十秒后才交给 AVAssetWriter，
-    /// 拿到的是悬垂指针 —— 写入器立刻 .failed（录不出文件/保存失败），严重时直接闪退。
-    func deepCopy() -> CMSampleBuffer? {
+    /// 这里刻意"不"去替换 data buffer。
+    /// 之前用 CMSampleBufferSetDataBuffer 把数据搬到自己 malloc 的内存里，看起来更安全，
+    /// 实际上这个 API 会失败（返回 OSStatus，之前被忽略）——一旦失败，拷贝出来的 buffer
+    /// 仍然指向原始那块会被系统回收的内存：帧数据失效 → AVAssetWriter 大量拒收
+    /// （视频只剩两三秒）→ 严重时变成悬垂指针直接闪退。
+    ///
+    /// CMSampleBufferCreateCopy 会 retain 内部 blockBuffer（引用计数），
+    /// 池子不会回收仍被持有的内存，这是官方推荐的"延长 sampleBuffer 生命周期"的方式。
+    /// VideoToolbox 编码产出的帧内存本就由我们独占，同样直接 retain 即可。
+    func retainedCopy() -> CMSampleBuffer? {
         var copy: CMSampleBuffer?
         let status = CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault,
                                               sampleBuffer: self,
                                               sampleBufferOut: &copy)
-        guard status == noErr, let duplicated = copy else { return nil }
-
-        guard let source = CMSampleBufferGetDataBuffer(self) else { return duplicated }
-        let totalLength = CMBlockBufferGetDataLength(source)
-        guard totalLength > 0 else { return duplicated }
-        guard let raw = malloc(totalLength) else { return duplicated }
-
-        var offset = 0
-        var contiguous = 0
-        var pointer: UnsafeMutablePointer<Int8>?
-        let pointerStatus = CMBlockBufferGetDataPointer(source,
-                                                        atOffset: 0,
-                                                        lengthAtOffsetOut: &offset,
-                                                        totalLengthOut: &contiguous,
-                                                        dataPointerOut: &pointer)
-        // 只支持单块连续内存（采集与编码产出的都是单块）
-        guard pointerStatus == noErr, let base = pointer, contiguous == totalLength else {
-            free(raw)
-            return duplicated
-        }
-        memcpy(raw, base, totalLength)
-
-        var newBlock: CMBlockBuffer?
-        let blockStatus = CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
-                                                             memoryBlock: raw,
-                                                             blockLength: totalLength,
-                                                             blockAllocator: kCFAllocatorDefault,
-                                                             customBlockSource: nil,
-                                                             offsetToData: 0,
-                                                             dataLength: totalLength,
-                                                             flags: 0,
-                                                             blockBufferOut: &newBlock)
-        guard blockStatus == noErr, let block = newBlock else {
-            free(raw)
-            return duplicated
-        }
-        CMSampleBufferSetDataBuffer(duplicated, newValue: block)
-        return duplicated
+        return status == noErr ? copy : nil
     }
 
     func pcmBuffer() -> AVAudioPCMBuffer? {
@@ -415,42 +383,49 @@ final class ClipWriter {
                 Log.write("[写入] 预录写入中止 status=\(assetWriter.status.rawValue) \(assetWriter.error?.localizedDescription ?? "")")
                 break
             }
-            let takeVideo: Bool
-            if audioIndex >= audio.count {
-                takeVideo = true
-            } else if videoIndex >= video.count {
-                takeVideo = false
+
+            let audioTrack = audioInput
+            let videoReady = videoTrack.isReadyForMoreMediaData
+            let audioReady = audioTrack?.isReadyForMoreMediaData ?? false
+            let hasVideo = videoIndex < video.count
+            let hasAudio = audioTrack != nil && audioIndex < audio.count
+
+            // 按 PTS 决定先写谁
+            var pickVideo: Bool
+            if !hasAudio {
+                pickVideo = true
+            } else if !hasVideo {
+                pickVideo = false
             } else {
-                takeVideo = CMTimeCompare(presentationTime(video[videoIndex]),
+                pickVideo = CMTimeCompare(presentationTime(video[videoIndex]),
                                           presentationTime(audio[audioIndex])) <= 0
             }
+            // 选中的那条轨没就绪就改走另一条。
+            // 否则音频轨一慢，整段预录写入会被卡住 —— 表现就是"视频只有两三秒"。
+            if pickVideo, !videoReady, audioReady {
+                pickVideo = false
+            } else if !pickVideo, !audioReady, videoReady {
+                pickVideo = true
+            }
 
-            if takeVideo {
-                if videoTrack.isReadyForMoreMediaData {
-                    if videoTrack.append(video[videoIndex]) {
-                        videoWritten += 1
-                        lastVideoPTS = presentationTime(video[videoIndex])
-                    } else {
-                        rejected += 1
-                    }
-                    videoIndex += 1
+            if pickVideo, hasVideo, videoReady {
+                if videoTrack.append(video[videoIndex]) {
+                    videoWritten += 1
+                    lastVideoPTS = presentationTime(video[videoIndex])
                 } else {
-                    Thread.sleep(forTimeInterval: 0.002)
+                    rejected += 1
                 }
-            } else if let audioTrack = audioInput {
-                if audioTrack.isReadyForMoreMediaData {
-                    if audioTrack.append(audio[audioIndex]) {
-                        audioWritten += 1
-                        lastAudioPTS = presentationTime(audio[audioIndex])
-                    } else {
-                        rejected += 1
-                    }
-                    audioIndex += 1
+                videoIndex += 1
+            } else if !pickVideo, hasAudio, audioReady, let target = audioTrack {
+                if target.append(audio[audioIndex]) {
+                    audioWritten += 1
+                    lastAudioPTS = presentationTime(audio[audioIndex])
                 } else {
-                    Thread.sleep(forTimeInterval: 0.002)
+                    rejected += 1
                 }
-            } else {
                 audioIndex += 1
+            } else {
+                Thread.sleep(forTimeInterval: 0.002)
             }
         }
         let usedMS = Int(Date().timeIntervalSince(began) * 1000)

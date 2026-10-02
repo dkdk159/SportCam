@@ -149,6 +149,8 @@ final class VoiceControl {
 
     func begin() {
         lock.lock()
+        // 上一次可能卡在半途（任务已销毁但标记还在），这里放行重新启动
+        if listening, task == nil, request == nil { listening = false }
         let already = listening
         lock.unlock()
         guard !already else { return }
@@ -790,11 +792,11 @@ final class CameraEngine: NSObject, ObservableObject {
         let needWrite = recording
         guard needRing || needStart || needWrite else { return }
 
-        // 关键帧标记必须在"原始 sample"上判断（深拷贝替换了 data buffer，附加信息可能丢失）
+        // 关键帧标记在"原始 sample"上判断（最准确）
         let isKey = sample.isSync
-        // 深拷贝，否则回调返回后就是悬垂指针
-        guard let frame = sample.deepCopy() else {
-            Log.write("[编码] 深拷贝失败")
+        // 保留拷贝，否则回调返回后内存会被回收
+        guard let frame = sample.retainedCopy() else {
+            Log.write("[编码] 拷贝失败")
             return
         }
         let time = presentationTime(frame)
@@ -1046,7 +1048,7 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
     private func handleAudio(_ sample: CMSampleBuffer) {
         if voiceActive { voice.feed(sample) }
         // 音频环形缓冲始终维护：既供预录音频，也给写入器提供格式提示
-        guard let copy = sample.deepCopy() else { return }
+        guard let copy = sample.retainedCopy() else { return }
         audioRing?.append(copy)
         if recording { writer.appendAudio(copy) }
     }
