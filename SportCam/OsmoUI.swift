@@ -32,6 +32,9 @@ private struct CameraPreview: UIViewRepresentable {
     let mirrored: Bool
     /// 防抖模式：预览也按设置里的档位来，取景器里看到的抖动抑制就是录进去的效果
     let stabilization: AVCaptureVideoStabilizationMode
+    /// 4:3 时取景器要"装得下整个画面"（上下留黑边），否则 resizeAspectFill 会把
+    /// 多出来的上下视野直接裁掉 —— 用户看到的就是"选了 4:3 画面没变"。
+    let fitInFrame: Bool
     /// 音量键 / iPhone 16 相机按钮：按一下切换录制
     let onCaptureButton: () -> Void
     /// 点按画面：分别给出「设备坐标」（给对焦用）和「屏幕坐标」（给对焦框用）
@@ -54,7 +57,7 @@ private struct CameraPreview: UIViewRepresentable {
     func makeUIView(context: Context) -> PreviewHost {
         let view = PreviewHost()
         view.previewLayer.session = session
-        view.previewLayer.videoGravity = .resizeAspectFill
+        view.previewLayer.videoGravity = fitInFrame ? .resizeAspect : .resizeAspectFill
         if #available(iOS 17.2, *) {
             view.addInteraction(AVCaptureEventInteraction { event in
                 if event.phase == .ended { onCaptureButton() }
@@ -80,6 +83,15 @@ private struct CameraPreview: UIViewRepresentable {
     }
 
     private func apply(_ view: PreviewHost) {
+        // 画面比例切换（16:9 ↔ 4:3）时同步取景方式：
+        // 4:3 装得下整幅（留黑边），16:9 铺满全屏。用 CATransaction 淡一下，切档不突兀。
+        let gravity: AVLayerVideoGravity = fitInFrame ? .resizeAspect : .resizeAspectFill
+        if view.previewLayer.videoGravity != gravity {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.22)
+            view.previewLayer.videoGravity = gravity
+            CATransaction.commit()
+        }
         guard let connection = view.previewLayer.connection else { return }
         if connection.isVideoOrientationSupported { connection.videoOrientation = orientation }
         if connection.isVideoMirroringSupported {
@@ -324,6 +336,7 @@ struct CameraScreen: View {
                           orientation: engine.videoOrientation,
                           mirrored: engine.cameraPosition == .front,
                           stabilization: engine.antiShake.mode,
+                          fitInFrame: engine.quality.is4x3,
                           onCaptureButton: {
                               // 音量键 / iPhone 16 相机按钮 → 切换录制（设置里可关）
                               if engine.volumeKeyRecording { engine.toggleRecording() }
@@ -696,6 +709,14 @@ struct CameraScreen: View {
                             engine.frameRate = item
                         }
                     }
+                }
+
+                // 真实输出尺寸：选的档是"名义值"，这里显示的是摄像头真正送出来的画面大小，
+                // 是不是真 4K 一眼就能对上（比如 3840×2160 才是真 4K，1920×1080 就是没给到）。
+                if !engine.actualResolution.isEmpty {
+                    Text("实际输出 \(engine.actualResolution)")
+                        .font(Palette.mono(11))
+                        .foregroundColor(Palette.accent)
                 }
 
                 Text(engine.isRecording ? "录制中不能改分辨率和帧率"

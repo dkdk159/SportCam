@@ -849,11 +849,18 @@ final class CameraEngine: NSObject, ObservableObject {
 
             let old = self.cameraInput
             // 换镜头前先关掉闪光灯：否则后置的灯会一直亮着，切到前置也关不掉
+            // 闪光灯必须在拿到配置锁之后才能改。以前写的是 try? lockForConfiguration()
+            // 然后直接 torchMode = .off —— 一旦取锁失败（设备正被系统配置），
+            // 这行就会抛 NSInternalInconsistencyException 直接把 App 打崩（"翻转闪退"就是它）。
             if let oldDevice = self.cameraDevice, oldDevice.hasTorch,
                oldDevice.isTorchModeSupported(.off) {
-                try? oldDevice.lockForConfiguration()
-                oldDevice.torchMode = .off
-                oldDevice.unlockForConfiguration()
+                do {
+                    try oldDevice.lockForConfiguration()
+                    oldDevice.torchMode = .off
+                    oldDevice.unlockForConfiguration()
+                } catch {
+                    Log.write("[镜头] 关灯失败（忽略）：\(error.localizedDescription)")
+                }
             }
             self.session.beginConfiguration()
             if let old = old { self.session.removeInput(old) }
@@ -1119,24 +1126,40 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var ultraWideAvailable = false
     /// 本机摄像头有没有真正的 4:3 视频格式（没有就不摆这两档，免得选了没效果）
     @Published var supports4x3 = false
+    /// 本机后置真能给出的分辨率档（假 4K / 假 4:3 都不在里面）
+    @Published var supportedQualities: [VideoQuality] = VideoQuality.allCases
+    /// 采集线程实际送出来的画面尺寸（"4K 到底真不真"的直接证据，显示在分辨率面板里）
+    @Published var actualResolution = ""
 
     func refreshLensAvailability() {
         // 和「视角」列表、实际切镜头同源（都走 ultraWideDevice）：
         // 三处结论必须一致，否则会出现「有 0.5x 档、视角里却没有超广角」这种自相矛盾。
         ultraWideAvailable = ultraWideDevice() != nil
+
         let back = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-        supports4x3 = back?.formats.contains { format in
-            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            guard Int(dims.width) >= 1440 else { return false }
-            return abs(Double(dims.width) / Double(dims.height) - 4.0 / 3.0) < 0.06
-        } ?? false
-        Log.write("[镜头] 超广角\(ultraWideAvailable ? "可用" : "不可用") · 4:3\(supports4x3 ? "可用" : "不可用")")
+        // 某一档「真的能做」= 设备存在一颗 ≥ 目标尺寸、且宽高比一致的视频格式。
+        // 只按尺寸判不行：4:3 的 1440×1080 会被同高的 16:9 1920×1080 蒙混过关；
+        // 只按预设判也不行：canSetSessionPreset 为 false 时界面照样显示 4K，
+        // 实际录出来还是 1080P —— 就是用户说的"假 4K"。两个条件都要满足才算数。
+        func reallySupports(_ quality: VideoQuality) -> Bool {
+            guard let back = back else { return false }
+            let target = quality.size
+            return back.formats.contains { format in
+                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                let w = Int(dims.width), h = Int(dims.height)
+                guard w >= target.width, h >= target.height else { return false }
+                return abs(Double(w) / Double(h) - quality.aspect) < 0.06
+            }
+        }
+        supports4x3 = reallySupports(.p1080x43)
+        // 按从高到低的顺序摆，但只保留本机真能给出的档
+        supportedQualities = VideoQuality.allCases.filter { reallySupports($0) }
+
+        Log.write("[镜头] 超广角\(ultraWideAvailable ? "可用" : "不可用") · 4:3\(supports4x3 ? "可用" : "不可用") · 分辨率档 \(supportedQualities.map(\.rawValue).joined(separator: "/"))")
     }
 
-    /// 可用的分辨率档：4:3 只有本机真支持才摆出来
-    var availableQualities: [VideoQuality] {
-        VideoQuality.allCases.filter { !$0.is4x3 || supports4x3 }
-    }
+    /// 可用的分辨率档：只摆本机真能给出的（假 4K 直接不显示）
+    var availableQualities: [VideoQuality] { supportedQualities.isEmpty ? VideoQuality.allCases : supportedQualities }
 
     /// 这一档在当前机型/当前镜头上能不能用。0.5x 需要后置超广角，前置也做不了。
     func isZoomChipAvailable(_ chip: String) -> Bool {
@@ -1814,10 +1837,15 @@ final class CameraEngine: NSObject, ObservableObject {
                 DispatchQueue.main.async { self.torchOn = false }
                 return
             }
-            try? device.lockForConfiguration()
-            device.torchMode = next ? .on : .off
-            device.unlockForConfiguration()
-            DispatchQueue.main.async { self.torchOn = next }
+            // 同 toggleCamera：取锁失败就不能再改 torchMode，否则直接崩
+            do {
+                try device.lockForConfiguration()
+                device.torchMode = next ? .on : .off
+                device.unlockForConfiguration()
+                DispatchQueue.main.async { self.torchOn = next }
+            } catch {
+                Log.write("[手电筒] 失败：\(error.localizedDescription)")
+            }
         }
     }
 
@@ -1917,6 +1945,10 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
             needEncoderRebuild = true
             recorder.reset()
             rearmPreRecord()
+            // 把真实尺寸报给界面：分辨率面板里会显示，用户一眼能看出 4K 是不是真的
+            let text = "\(width)×\(height)"
+            DispatchQueue.main.async { [weak self] in self?.actualResolution = text }
+            Log.write("[采集] 实际分辨率 \(text)")
             if recording {
                 Log.write("[采集] 录制中画面尺寸变化，停止本次录制")
                 DispatchQueue.main.async { self.stopRecording() }
