@@ -424,6 +424,13 @@ final class CameraEngine: NSObject, ObservableObject {
     let level = LevelSensor()
 
     private let sessionQueue = DispatchQueue(label: "com.sportcam.session")
+    /// 设备参数（曝光/ISO/快门/白平衡/对焦/变焦）专用队列。
+    /// 绝不能和采集回调共用 sessionQueue —— 那会让每一条配置都排在帧处理后面，
+    /// 拖动滑杆时表现为"手指动了、画面和数值要等一两秒才跟上"。
+    private let deviceQueue = DispatchQueue(label: "com.sportcam.device", qos: .userInteractive)
+    private let proLock = NSLock()
+    private var pendingPro: [ProControl] = []
+    private var proDraining = false
     private let videoOutput = AVCaptureVideoDataOutput()
     private let audioOutput = AVCaptureAudioDataOutput()
     private let encoder = H264Encoder()
@@ -433,7 +440,13 @@ final class CameraEngine: NSObject, ObservableObject {
     private let voice = VoiceControl()
     private let power = PowerMonitor()
 
-    private var cameraDevice: AVCaptureDevice?
+    // cameraDevice 在 sessionQueue 上写、在 deviceQueue / 主线程上读，加锁保证不会读到半路换掉的引用
+    private let deviceRefLock = NSLock()
+    private var storedCameraDevice: AVCaptureDevice?
+    private var cameraDevice: AVCaptureDevice? {
+        get { deviceRefLock.lock(); defer { deviceRefLock.unlock() }; return storedCameraDevice }
+        set { deviceRefLock.lock(); defer { deviceRefLock.unlock() }; storedCameraDevice = newValue }
+    }
     private var cameraInput: AVCaptureDeviceInput?
     private var deliveredSize = CGSize.zero
     private var needEncoderRebuild = false
@@ -773,15 +786,24 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    func applyZoom() { sessionQueue.async { [weak self] in self?.applyZoomLocked() } }
+    func applyZoom() { applyPro(.zoom) }
 
     private func applyZoomLocked() {
         guard let device = cameraDevice else { return }
         do {
             try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
             let maxFactor = min(device.activeFormat.videoMaxZoomFactor, 8.0)
-            device.videoZoomFactor = max(1.0, min(zoom, maxFactor))
-            device.unlockForConfiguration()
+            let target = max(1.0, min(zoom, maxFactor))
+            if device.isRampingVideoZoom { device.cancelVideoZoomRamp() }
+            let distance = abs(target - device.videoZoomFactor)
+            if distance < 0.01 {
+                device.videoZoomFactor = target
+            } else {
+                // 直接赋值会让系统在 2x 附近反复切镜头、重新对焦，手感一顿一顿的。
+                // 用 0.15 秒跑完的小斜坡，既跟手又不触发镜头震荡。
+                device.ramp(toVideoZoomFactor: target, withRate: Float(max(distance / 0.15, 5)))
+            }
         } catch {
             Log.write("[变焦] 失败 \(error.localizedDescription)")
         }
@@ -954,7 +976,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
     /// 点按画面对焦 + 测光
     func focus(atDevicePoint point: CGPoint) {
-        sessionQueue.async { [weak self] in
+        deviceQueue.async { [weak self] in
             guard let self = self, let device = self.cameraDevice else { return }
             do {
                 try device.lockForConfiguration()
@@ -983,14 +1005,36 @@ final class CameraEngine: NSObject, ObservableObject {
         return exp(log(lo) + t * (log(hi) - log(lo)))
     }
 
+    /// 拖动滑杆时每秒会回调几十次，中间值没必要逐个下发给硬件（它也来不及响应）。
+    /// 这里做两件事：
+    ///   1) 同一参数在队列里最多只留一份，后面的直接覆盖前面的（合并成一次下发）；
+    ///   2) 全部跑在 deviceQueue 上，不再占用采集回调队列。
     private func applyPro(_ control: ProControl) {
-        sessionQueue.async { [weak self] in
-            guard let self = self else { return }
+        proLock.lock()
+        if !pendingPro.contains(control) { pendingPro.append(control) }
+        let busy = proDraining
+        proDraining = true
+        proLock.unlock()
+        guard !busy else { return }
+        deviceQueue.async { [weak self] in self?.drainPro() }
+    }
+
+    private func drainPro() {
+        while true {
+            proLock.lock()
+            guard !pendingPro.isEmpty else {
+                proDraining = false
+                proLock.unlock()
+                return
+            }
+            let control = pendingPro.removeFirst()
+            proLock.unlock()
+            // 这里读到的永远是该参数的最新值
             switch control {
-            case .whiteBalance: self.applyWhiteBalanceLocked()
-            case .focus: self.applyFocusLocked()
-            case .zoom: self.applyZoomLocked()
-            case .exposure, .shutter, .iso: self.applyExposureLocked()
+            case .whiteBalance: applyWhiteBalanceLocked()
+            case .focus: applyFocusLocked()
+            case .zoom: applyZoomLocked()
+            case .exposure, .shutter, .iso: applyExposureLocked()
             }
         }
     }
@@ -1001,7 +1045,9 @@ final class CameraEngine: NSObject, ObservableObject {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
             if focusLensPosition < 0 {
-                if device.isFocusModeSupported(.continuousAutoFocus) {
+                // 每帧都重设模式会让 AF 重新收敛一遍，画面一顿一顿的 —— 只在需要时切
+                if device.isFocusModeSupported(.continuousAutoFocus),
+                   device.focusMode != .continuousAutoFocus {
                     device.focusMode = .continuousAutoFocus
                 }
             } else if device.isFocusModeSupported(.locked) {
@@ -1031,7 +1077,10 @@ final class CameraEngine: NSObject, ObservableObject {
                     device.setExposureModeCustom(duration: duration, iso: iso, completionHandler: nil)
                 }
             } else if device.isExposureModeSupported(.continuousAutoExposure) {
-                device.exposureMode = .continuousAutoExposure
+                // 同上：模式没变就别重设，否则 AE 每帧重新收敛
+                if device.exposureMode != .continuousAutoExposure {
+                    device.exposureMode = .continuousAutoExposure
+                }
                 device.setExposureTargetBias(exposureBias, completionHandler: nil)
             }
         } catch {
@@ -1045,7 +1094,8 @@ final class CameraEngine: NSObject, ObservableObject {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
             if whiteBalanceKelvin <= 0 {
-                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance),
+                   device.whiteBalanceMode != .continuousAutoWhiteBalance {
                     device.whiteBalanceMode = .continuousAutoWhiteBalance
                 }
             } else if device.isWhiteBalanceModeSupported(.locked) {

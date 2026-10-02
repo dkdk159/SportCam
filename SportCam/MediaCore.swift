@@ -731,9 +731,10 @@ enum SegmentMerger {
         let videoComposition = watermark.flatMap { WatermarkComposition.make(asset: composition, config: $0) }
         var ok: Bool
         if let videoComposition = videoComposition {
-            // 叠了水印就没法走 Passthrough（系统会拒绝），只能重编码一次
+            // 叠了水印就没法走 Passthrough（系统会拒绝），只能重编码一次。
+            // 预设按源分辨率挑，别用 HighestQuality 把 720p 往上补。
             ok = export(composition, videoComposition: videoComposition, to: output,
-                        preset: AVAssetExportPresetHighestQuality)
+                        preset: recodePreset(for: composition))
         } else {
             ok = export(composition, videoComposition: nil, to: output,
                         preset: AVAssetExportPresetPassthrough)
@@ -753,7 +754,22 @@ enum SegmentMerger {
         return ok
     }
 
-    /// 导出。参考 App 用的就是 .mov + shouldOptimizeForNetworkUse。
+    /// 重编码时按源分辨率挑预设。
+    /// HighestQuality 会把 720p 往上补，白白多花时间、画质也没收益。
+    private static func recodePreset(for asset: AVAsset) -> String {
+        guard let track = asset.tracks(withMediaType: .video).first else {
+            return AVAssetExportPresetHighestQuality
+        }
+        let size = track.naturalSize
+        let shortSide = min(size.width, size.height)
+        if shortSide <= 600 { return AVAssetExportPreset640x480 }
+        if shortSide <= 800 { return AVAssetExportPreset1280x720 }
+        if shortSide <= 1200 { return AVAssetExportPreset1920x1080 }
+        if shortSide <= 2200 { return AVAssetExportPreset3840x2160 }
+        return AVAssetExportPresetHighestQuality
+    }
+
+    /// 导出。参考 App 用的就是 .mov。
     private static func export(_ composition: AVAsset, videoComposition: AVVideoComposition?,
                                to output: URL, preset: String) -> Bool {
         guard let exporter = AVAssetExportSession(asset: composition, presetName: preset) else {
@@ -763,7 +779,8 @@ enum SegmentMerger {
         try? FileManager.default.removeItem(at: output)
         exporter.outputURL = output
         exporter.outputFileType = .mov
-        exporter.shouldOptimizeForNetworkUse = true
+        // 本地保存不需要 fast-start，开了反而要多写一遍文件
+        exporter.shouldOptimizeForNetworkUse = false
         exporter.videoComposition = videoComposition
         let done = DispatchSemaphore(value: 0)
         exporter.exportAsynchronously { done.signal() }
