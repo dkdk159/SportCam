@@ -56,23 +56,6 @@ private struct CameraPreview: UIViewRepresentable {
 }
 
 // MARK: - 小控件
-private struct Pill: View {
-    let text: String
-    var color: Color = .white
-    var size: CGFloat = 12
-
-    var body: some View {
-        Text(text)
-            .font(Palette.mono(size))
-            .foregroundColor(color)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(Palette.glass)
-            .clipShape(Capsule())
-            .overlay(Capsule().stroke(Palette.border, lineWidth: 0.5))
-    }
-}
-
 private struct CircleIcon: View {
     let icon: String
     var active = false
@@ -140,6 +123,7 @@ private struct LevelOverlay: View {
 struct CameraScreen: View {
     @ObservedObject var engine: CameraEngine
     @State private var showSettings = false
+    @State private var showDuration = false
     @State private var pinching = false
     @State private var zoomBase: CGFloat = 1.0
 
@@ -164,10 +148,11 @@ struct CameraScreen: View {
 
             VStack(spacing: 0) {
                 topBar
+                statusPill
                 Spacer()
                 if engine.showLevel {
                     LevelOverlay(sensor: engine.level)
-                    Spacer().frame(height: 18)
+                    Spacer().frame(height: 14)
                 }
                 bottomBar
             }
@@ -232,201 +217,327 @@ struct CameraScreen: View {
                         }
                     )
             }
+
+            if showDuration { durationPicker }
         }
         .onAppear { engine.launch() }
         .statusBar(hidden: true)
         .sheet(isPresented: $showSettings) { SettingsSheet(engine: engine) }
     }
 
-    // MARK: 顶部（苹果相机：左上闪光灯 / 右上更多）
+    // MARK: 顶部（左上：剩余空间 + 画质；右上：电量 + 闪光灯）
     private var topBar: some View {
-        VStack(spacing: 10) {
-            HStack {
-                CircleIcon(icon: engine.torchOn ? "bolt.fill" : "bolt.slash.fill",
-                           active: engine.torchOn,
-                           tint: Palette.appleYellow) {
-                    engine.toggleTorch()
-                }
-                Spacer()
-                if engine.voiceListening {
-                    Pill(text: "🎙 语音", color: Palette.accent)
-                }
-                Pill(text: "\(Int(engine.battery * 100))%")
-                CircleIcon(icon: "ellipsis.circle") { showSettings = true }
-            }
-
-            // 录制计时 / 预录中 / 处理中
-            if engine.isBusy {
-                HStack(spacing: 7) {
-                    ProgressView()
-                        .progressViewStyle(CircularProgressViewStyle(tint: Palette.appleYellow))
-                        .scaleEffect(0.8)
-                    Text("正在保存到相册…")
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 5) {
+                    Image(systemName: "internaldrive").font(.system(size: 10))
+                    Text("\(engine.freeSpaceText) / \(engine.recordableText)")
                         .font(Palette.mono(11))
-                        .foregroundColor(Palette.appleYellow)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
-                .background(Color.black.opacity(0.55))
-                .clipShape(Capsule())
-            } else if engine.isRecording {
-                HStack(spacing: 7) {
-                    Circle().fill(Palette.record).frame(width: 9, height: 9)
-                    Text(timeText(engine.recordSeconds))
-                        .font(Palette.mono(17, .bold))
-                        .foregroundColor(.white)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
-                .background(Color.black.opacity(0.55))
-                .clipShape(Capsule())
-            } else if engine.preRecordOn {
-                HStack(spacing: 6) {
-                    Circle().fill(Palette.accent).frame(width: 7, height: 7)
-                    Text("预录中 · \(engine.preRecordDelay.label)")
-                        .font(Palette.mono(11))
-                        .foregroundColor(Palette.accent)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
+                .foregroundColor(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
                 .background(Palette.glass)
                 .clipShape(Capsule())
-                .overlay(Capsule().stroke(Palette.accent.opacity(0.6), lineWidth: 0.5))
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 10)
-    }
 
-    // MARK: 底部（苹果相机：变焦 / 模式 / 参数 / 快门）
-    private var bottomBar: some View {
-        VStack(spacing: 14) {
-            // 变焦
-            HStack(spacing: 14) {
-                ForEach(["0.5x", "1x", "2x"], id: \.self) { chip in
-                    Button {
-                        engine.selectZoomChip(chip)
-                    } label: {
-                        Text(chip)
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundColor(zoomSelected(chip) ? .black : .white)
-                            .frame(width: 40, height: 40)
-                            .background(zoomSelected(chip) ? Color.white : Color.black.opacity(0.35))
-                            .clipShape(Circle())
-                            .overlay(Circle().stroke(Palette.border, lineWidth: 0.5))
+                Text("\(engine.quality.rawValue)/\(engine.frameRate.rawValue)")
+                    .font(Palette.mono(11))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Palette.glass)
+                    .clipShape(Capsule())
+            }
+
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 8) {
+                HStack(spacing: 8) {
+                    if engine.voiceListening {
+                        Text("🎙")
+                            .font(.system(size: 11))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(Palette.glass)
+                            .clipShape(Capsule())
                     }
-                    .buttonStyle(PlainButtonStyle())
-                    .disabled(engine.isRecording)
-                }
-                if engine.zoom > 1.05 {
-                    Text(String(format: "%.1fx", engine.zoom))
-                        .font(Palette.mono(12))
+                    Text("\(Int(engine.battery * 100))%")
+                        .font(Palette.mono(11))
                         .foregroundColor(.white)
-                        .padding(.horizontal, 9)
+                        .padding(.horizontal, 10)
                         .padding(.vertical, 5)
                         .background(Palette.glass)
                         .clipShape(Capsule())
                 }
-            }
-
-            // 模式（苹果相机的黄色选中态）
-            HStack(spacing: 22) {
-                modeItem(title: "视频", selected: !engine.preRecordOn) {
-                    if engine.preRecordOn { engine.preRecordOn = false }
-                }
-                modeItem(title: "预录", selected: engine.preRecordOn) {
-                    if !engine.preRecordOn { engine.preRecordOn = true }
+                CircleIcon(icon: engine.torchOn ? "bolt.fill" : "bolt.slash.fill",
+                           active: engine.torchOn,
+                           tint: Palette.appleYellow,
+                           diameter: 38) {
+                    engine.toggleTorch()
                 }
             }
-
-            // 参数行（点击进设置，像苹果相机顶部那个参数条）
-            Button {
-                showSettings = true
-            } label: {
-                HStack(spacing: 8) {
-                    Text("\(engine.quality.rawValue) · \(engine.frameRate.rawValue)fps")
-                    Text("·")
-                    Text(engine.fieldOfView.rawValue)
-                    Text("·")
-                    Text("防抖\(engine.antiShake.rawValue)")
-                }
-                .font(Palette.mono(11))
-                .foregroundColor(Palette.appleYellow.opacity(0.9))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(Palette.glass)
-                .clipShape(Capsule())
-            }
-            .buttonStyle(PlainButtonStyle())
-            .disabled(engine.isRecording)
-            .opacity(engine.isRecording ? 0.4 : 1)
-
-            // 快门行
-            HStack {
-                Button {
-                    engine.openPhotos()
-                } label: {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Palette.glass)
-                        .frame(width: 46, height: 46)
-                        .overlay(
-                            Image(systemName: "photo.on.rectangle")
-                                .font(.system(size: 18))
-                                .foregroundColor(.white)
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .stroke(Palette.border, lineWidth: 0.5)
-                        )
-                }
-                .buttonStyle(PlainButtonStyle())
-
-                Spacer()
-
-                Button {
-                    if engine.isRecording { engine.stopRecording() } else { engine.startRecording() }
-                } label: {
-                    ZStack {
-                        Circle().stroke(Color.white, lineWidth: 4).frame(width: 78, height: 78)
-                        if engine.isBusy {
-                            ProgressView()
-                                .progressViewStyle(CircularProgressViewStyle(tint: Palette.appleYellow))
-                                .scaleEffect(1.4)
-                        } else if engine.isRecording {
-                            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .fill(Palette.record)
-                                .frame(width: 34, height: 34)
-                        } else {
-                            Circle().fill(Palette.record).frame(width: 63, height: 63)
-                        }
-                    }
-                }
-                .buttonStyle(PlainButtonStyle())
-                .disabled(engine.isBusy)
-
-                Spacer()
-
-                CircleIcon(icon: "arrow.triangle.2.circlepath.camera", diameter: 46) {
-                    let order: [FieldOfView] = [.ultraWide, .wide, .telephoto]
-                    if let index = order.firstIndex(of: engine.fieldOfView) {
-                        engine.fieldOfView = order[(index + 1) % order.count]
-                    }
-                }
-            }
-            .padding(.horizontal, 34)
         }
-        .padding(.bottom, 18)
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
     }
 
-    private func modeItem(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    // MARK: 状态胶囊（预录中 / 录制中 / 保存中）
+    @ViewBuilder
+    private var statusPill: some View {
+        if engine.isBusy {
+            HStack(spacing: 7) {
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: Palette.appleYellow))
+                    .scaleEffect(0.8)
+                Text("正在保存到相册…")
+                    .font(Palette.mono(12))
+                    .foregroundColor(Palette.appleYellow)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .background(Color.black.opacity(0.55))
+            .clipShape(Capsule())
+            .padding(.top, 10)
+        } else if engine.isRecording {
+            HStack(spacing: 7) {
+                Circle().fill(Palette.record).frame(width: 9, height: 9)
+                Text(timeText(engine.recordSeconds))
+                    .font(Palette.mono(17, .bold))
+                    .foregroundColor(.white)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .background(Color.black.opacity(0.55))
+            .clipShape(Capsule())
+            .padding(.top, 10)
+        } else {
+            Button {
+                showDuration = true
+            } label: {
+                HStack(spacing: 9) {
+                    ZStack {
+                        Circle()
+                            .stroke(Color.white.opacity(0.35), lineWidth: 3)
+                            .frame(width: 30, height: 30)
+                        if engine.preRecordOn {
+                            Circle()
+                                .trim(from: 0, to: preRecordProgress)
+                                .stroke(Color.white, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                                .frame(width: 30, height: 30)
+                                .rotationEffect(.degrees(-90))
+                        }
+                        Image(systemName: "camera.fill")
+                            .font(.system(size: 12))
+                            .foregroundColor(.white)
+                    }
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(engine.preRecordOn ? timeText(engine.preRecordSeconds) : "--:--")
+                            .font(Palette.mono(15, .bold))
+                            .foregroundColor(.white)
+                        Text(engine.preRecordOn ? "预录制中" : "未开预录")
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.92))
+                    }
+                    .frame(width: 62, alignment: .leading)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(engine.preRecordOn ? Palette.accent : Color.black.opacity(0.5))
+                .clipShape(Capsule())
+                .overlay(Capsule().stroke(Color.white.opacity(0.22), lineWidth: 0.5))
+            }
+            .buttonStyle(PlainButtonStyle())
+            .padding(.top, 10)
+        }
+    }
+
+    private var preRecordProgress: CGFloat {
+        let window = max(engine.preRecordDelay.rawValue, 1)
+        return min(max(CGFloat(engine.preRecordSeconds) / CGFloat(window), 0), 1)
+    }
+
+    // MARK: 设置预录时长（点预录胶囊 / 点右下角时间按钮都会弹这个）
+    private var durationPicker: some View {
+        ZStack {
+            Color.black.opacity(0.45)
+                .ignoresSafeArea()
+                .onTapGesture { showDuration = false }
+
+            VStack(spacing: 16) {
+                Text("设置预录时长")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.white)
+
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3),
+                          spacing: 10) {
+                    durationCell("关闭", value: nil)
+                    ForEach(PreRecordDelay.allCases) { delay in
+                        durationCell(delay.label, value: delay)
+                    }
+                }
+
+                Text("预录会在按下录像前先缓存这段时间的画面")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.55))
+            }
+            .padding(20)
+            .frame(maxWidth: 320)
+            .background(Color(red: 0.16, green: 0.16, blue: 0.17))
+            .cornerRadius(16)
+        }
+    }
+
+    private func durationCell(_ title: String, value: PreRecordDelay?) -> some View {
+        let selected: Bool = {
+            guard let value = value else { return !engine.preRecordOn }
+            return engine.preRecordOn && engine.preRecordDelay == value
+        }()
+        return Button {
+            if let value = value {
+                engine.preRecordDelay = value
+                engine.preRecordOn = true
+            } else {
+                engine.preRecordOn = false
+            }
+            showDuration = false
+        } label: {
             Text(title)
-                .font(.system(size: 14, weight: selected ? .bold : .medium))
-                .foregroundColor(selected ? Palette.appleYellow : Color.white.opacity(0.6))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 40)
+                .background(selected ? Color(red: 0.13, green: 0.48, blue: 0.95)
+                                     : Color.white.opacity(0.10))
+                .cornerRadius(8)
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+
+    // MARK: 底部（变焦胶囊 / 功能图标行 / 快门行）
+    private var bottomBar: some View {
+        VStack(spacing: 16) {
+            zoomPill
+            toolRow
+            shutterRow
+        }
+        .padding(.bottom, 16)
+    }
+
+    private var zoomPill: some View {
+        HStack(spacing: 4) {
+            ForEach(["0.5x", "1x", "2x"], id: \.self) { chip in
+                Button {
+                    engine.selectZoomChip(chip)
+                } label: {
+                    Text(chip)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(zoomSelected(chip) ? .black : .white)
+                        .frame(width: 34, height: 34)
+                        .background(zoomSelected(chip) ? Color.white : Color.clear)
+                        .clipShape(Circle())
+                }
+                .buttonStyle(PlainButtonStyle())
+                .disabled(engine.isRecording)
+            }
+        }
+        .padding(4)
+        .background(Color.black.opacity(0.45))
+        .clipShape(Capsule())
+    }
+
+    private var toolRow: some View {
+        HStack(spacing: 0) {
+            toolItem("grid", "网格", engine.showGrid) { engine.showGrid.toggle() }
+            toolItem("circle.dashed", "水平仪", engine.showLevel) { engine.showLevel.toggle() }
+            toolItem("camera.filters", "防抖", engine.antiShake != .off) { cycleAntiShake() }
+            toolItem("arrow.triangle.2.circlepath.camera", "镜头", false) { cycleLens() }
+            toolItem("speaker.wave.2.fill", "提示音", engine.beepOn) { engine.beepOn.toggle() }
+            toolItem("gearshape.fill", "设置", false) { showSettings = true }
+        }
+        .padding(.horizontal, 8)
+    }
+
+    private func toolItem(_ icon: String, _ title: String, _ active: Bool,
+                          _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(active ? Palette.appleYellow : .white)
+                Text(title)
+                    .font(.system(size: 10))
+                    .foregroundColor(active ? Palette.appleYellow : .white.opacity(0.85))
+            }
+            .frame(maxWidth: .infinity)
         }
         .buttonStyle(PlainButtonStyle())
         .disabled(engine.isRecording)
         .opacity(engine.isRecording ? 0.4 : 1)
+    }
+
+    private var shutterRow: some View {
+        HStack {
+            Button {
+                engine.openPhotos()
+            } label: {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Palette.glass)
+                    .frame(width: 46, height: 46)
+                    .overlay(
+                        Image(systemName: "photo.on.rectangle")
+                            .font(.system(size: 18))
+                            .foregroundColor(.white)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(Palette.border, lineWidth: 0.5)
+                    )
+            }
+            .buttonStyle(PlainButtonStyle())
+
+            Spacer()
+
+            Button {
+                if engine.isRecording { engine.stopRecording() } else { engine.startRecording() }
+            } label: {
+                ZStack {
+                    Circle().stroke(Color.white, lineWidth: 4).frame(width: 78, height: 78)
+                    if engine.isBusy {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: Palette.appleYellow))
+                            .scaleEffect(1.4)
+                    } else if engine.isRecording {
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Palette.record)
+                            .frame(width: 34, height: 34)
+                    } else {
+                        Circle().fill(Palette.record).frame(width: 63, height: 63)
+                    }
+                }
+            }
+            .buttonStyle(PlainButtonStyle())
+            .disabled(engine.isBusy)
+
+            Spacer()
+
+            // 单独的时间入口：点一下就能改预录时长
+            CircleIcon(icon: "timer", diameter: 46) { showDuration = true }
+        }
+        .padding(.horizontal, 34)
+    }
+
+    private func cycleAntiShake() {
+        let order: [AntiShake] = [.off, .standard, .cinematic, .auto]
+        if let index = order.firstIndex(of: engine.antiShake) {
+            engine.antiShake = order[(index + 1) % order.count]
+        }
+    }
+
+    private func cycleLens() {
+        let order: [FieldOfView] = [.ultraWide, .wide, .telephoto]
+        if let index = order.firstIndex(of: engine.fieldOfView) {
+            engine.fieldOfView = order[(index + 1) % order.count]
+        }
     }
 
     private func zoomSelected(_ chip: String) -> Bool {

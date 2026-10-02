@@ -360,6 +360,9 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var showLog = false
     @Published var logText = ""
     @Published var segmentCount = 0
+    @Published var preRecordSeconds = 0       // 预录窗口内已缓存秒数（到设定时长后停住）
+    @Published var freeSpaceText = "--"       // 剩余存储空间
+    @Published var recordableText = "--"      // 按当前画质预估可录时长
     // 注意：这两个计数器每帧自增，绝不能是 @Published，否则每秒触发 30 次界面重绘
     var encodedFrames = 0
     var receivedFrames = 0
@@ -422,6 +425,7 @@ final class CameraEngine: NSObject, ObservableObject {
     private var recordTimer: Timer?
     private var powerTimer: Timer?
     private var uiTimer: Timer?
+    private var storageTick = 0
 
     // MARK: 启动
     func launch() {
@@ -437,6 +441,7 @@ final class CameraEngine: NSObject, ObservableObject {
         uiTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.runWatchdogs()
+            self.tickStatus()
             guard self.debugInfo || self.showLog else { return }
             let head = "帧:\(self.receivedFrames) 编码:\(self.encodedFrames) 段:\(self.segmentCount) "
                 + "录:\(self.isRecording ? "Y" : "N") 预录:\(self.preRecordOn ? "Y" : "N")"
@@ -685,6 +690,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
     // MARK: 预录
     private func syncPreRecord() {
+        preRecordSeconds = 0
         if preRecordOn {
             rearmPreRecord()
         } else {
@@ -878,6 +884,31 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     // MARK: 计时 / 提示 / 省电
+    /// 每秒刷新预录计时与剩余空间（供主界面显示）
+    private func tickStatus() {
+        if preRecordOn && !isRecording {
+            let window = max(preRecordDelay.rawValue, 1)
+            if preRecordSeconds < window { preRecordSeconds += 1 }
+        } else if preRecordSeconds != 0 {
+            preRecordSeconds = 0
+        }
+        storageTick += 1
+        if storageTick >= 5 {
+            storageTick = 0
+            refreshStorage()
+        }
+    }
+
+    private func refreshStorage() {
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        guard let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+              let bytes = values.volumeAvailableCapacityForImportantUsage, bytes > 0 else { return }
+        freeSpaceText = String(format: "%.1fGB", Double(bytes) / 1_000_000_000)
+        let bitrate = Double(max(quality.size.width * quality.size.height * 3, 6_000_000)) / 8.0
+        let seconds = Double(bytes) / bitrate
+        recordableText = String(format: "%dh%02dm", Int(seconds) / 3600, (Int(seconds) % 3600) / 60)
+    }
+
     private func startRecordTimer() {
         recordTimer?.invalidate()
         recordTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
