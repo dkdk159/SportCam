@@ -31,6 +31,22 @@ private struct CameraPreview: UIViewRepresentable {
     let mirrored: Bool
     /// 音量键 / iPhone 16 相机按钮：按一下切换录制
     let onCaptureButton: () -> Void
+    /// 点按画面：分别给出「设备坐标」（给对焦用）和「屏幕坐标」（给对焦框用）
+    let onFocusPoint: (CGPoint, CGPoint) -> Void
+
+    final class Coordinator: NSObject {
+        weak var view: PreviewHost?
+        var onFocusPoint: (CGPoint, CGPoint) -> Void = { _, _ in }
+
+        @objc func handleTap(_ gesture: UITapGestureRecognizer) {
+            guard let view = view else { return }
+            let layerPoint = gesture.location(in: view)
+            let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: layerPoint)
+            onFocusPoint(devicePoint, layerPoint)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIView(context: Context) -> PreviewHost {
         let view = PreviewHost()
@@ -41,11 +57,20 @@ private struct CameraPreview: UIViewRepresentable {
                 if event.phase == .ended { onCaptureButton() }
             })
         }
+        context.coordinator.view = view
+        context.coordinator.onFocusPoint = onFocusPoint
+        let tap = UITapGestureRecognizer(target: context.coordinator,
+                                         action: #selector(Coordinator.handleTap(_:)))
+        view.addGestureRecognizer(tap)
         apply(view)
         return view
     }
 
-    func updateUIView(_ view: PreviewHost, context: Context) { apply(view) }
+    func updateUIView(_ view: PreviewHost, context: Context) {
+        context.coordinator.view = view
+        context.coordinator.onFocusPoint = onFocusPoint
+        apply(view)
+    }
 
     private func apply(_ view: PreviewHost) {
         guard let connection = view.previewLayer.connection else { return }
@@ -181,6 +206,7 @@ struct CameraScreen: View {
     @State private var showDuration = false
     @State private var pinching = false
     @State private var zoomBase: CGFloat = 1.0
+    @State private var focusReticle: CGPoint?
 
     var body: some View {
         ZStack {
@@ -189,7 +215,14 @@ struct CameraScreen: View {
             CameraPreview(session: engine.session,
                           orientation: engine.videoOrientation,
                           mirrored: engine.cameraPosition == .front,
-                          onCaptureButton: { engine.toggleRecording() })
+                          onCaptureButton: { engine.toggleRecording() },
+                          onFocusPoint: { devicePoint, layerPoint in
+                              engine.focus(atDevicePoint: devicePoint)
+                              withAnimation(.easeOut(duration: 0.12)) { focusReticle = layerPoint }
+                              DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+                                  withAnimation(.easeIn(duration: 0.25)) { focusReticle = nil }
+                              }
+                          })
                 .ignoresSafeArea()
                 .gesture(
                     MagnificationGesture()
@@ -201,6 +234,14 @@ struct CameraScreen: View {
                 )
 
             if engine.showGrid { GridOverlay().ignoresSafeArea() }
+
+            if let point = focusReticle {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(Palette.appleYellow, lineWidth: 1.5)
+                    .frame(width: 76, height: 76)
+                    .position(point)
+                    .allowsHitTesting(false)
+            }
 
             VStack(spacing: 0) {
                 topBar
@@ -333,11 +374,14 @@ struct CameraScreen: View {
                         .background(Palette.glass)
                         .clipShape(Capsule())
                 }
-                CircleIcon(icon: engine.torchOn ? "bolt.fill" : "bolt.slash.fill",
-                           active: engine.torchOn,
-                           tint: Palette.appleYellow,
-                           diameter: 38) {
-                    engine.toggleTorch()
+                HStack(spacing: 8) {
+                    CircleIcon(icon: engine.torchOn ? "bolt.fill" : "bolt.slash.fill",
+                               active: engine.torchOn,
+                               tint: Palette.appleYellow,
+                               diameter: 38) {
+                        engine.toggleTorch()
+                    }
+                    CircleIcon(icon: "gearshape.fill", diameter: 38) { showSettings = true }
                 }
             }
         }
@@ -511,12 +555,11 @@ struct CameraScreen: View {
 
     private var toolRow: some View {
         HStack(spacing: 0) {
-            toolItem("sun.max.fill", "曝光", engine.proIsManual(.exposure)) { engine.openPro(.exposure) }
-            toolItem("camera.aperture", "ISO", engine.proIsManual(.iso)) { engine.openPro(.iso) }
-            toolItem("timer", "快门", engine.proIsManual(.shutter)) { engine.openPro(.shutter) }
-            toolItem("thermometer.medium", "白平衡", engine.proIsManual(.whiteBalance)) { engine.openPro(.whiteBalance) }
-            toolItem("arrow.triangle.2.circlepath.camera", "翻转", engine.cameraPosition == .front) { engine.toggleCamera() }
-            toolItem("gearshape.fill", "设置", false) { showSettings = true }
+            ForEach(ProControl.allCases) { control in
+                toolItem(control.icon, control.rawValue, engine.proIsManual(control)) {
+                    engine.openPro(control)
+                }
+            }
         }
         .padding(.horizontal, 8)
     }
@@ -682,7 +725,13 @@ struct SettingsSheet: View {
                     }.disabled(engine.isRecording)
                     Picker("视角", selection: $engine.fieldOfView) {
                         ForEach(FieldOfView.allCases) { Text($0.rawValue).tag($0) }
-                    }.disabled(engine.isRecording)
+                    }.disabled(engine.isRecording || engine.cameraPosition == .front)
+                    Toggle("前置摄像头", isOn: Binding(
+                        get: { engine.cameraPosition == .front },
+                        set: { want in
+                            if want != (engine.cameraPosition == .front) { engine.toggleCamera() }
+                        }
+                    )).disabled(engine.isRecording)
                     Picker("防抖", selection: $engine.antiShake) {
                         ForEach(AntiShake.allCases) { Text($0.rawValue).tag($0) }
                     }.disabled(engine.isRecording)

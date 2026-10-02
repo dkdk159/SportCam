@@ -71,19 +71,23 @@ enum AntiShake: String, CaseIterable, Identifiable {
     }
 }
 
-/// 专业参数（底部滑杆面板）
+/// 专业参数（底部滑杆面板）——顺序对齐参考 App：曝光/快门/感光度/白平衡/对焦/变焦
 enum ProControl: String, CaseIterable, Identifiable {
     case exposure = "曝光"
-    case iso = "ISO"
     case shutter = "快门"
+    case iso = "感光度"
     case whiteBalance = "白平衡"
+    case focus = "对焦"
+    case zoom = "变焦"
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .exposure: return "sun.max.fill"
-        case .iso: return "camera.aperture"
         case .shutter: return "timer"
+        case .iso: return "camera.aperture"
         case .whiteBalance: return "thermometer.medium"
+        case .focus: return "viewfinder"
+        case .zoom: return "plus.magnifyingglass"
         }
     }
 }
@@ -398,6 +402,7 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var isoValue: Float = 0              // 0 = 自动
     @Published var shutterSeconds: Double = 0       // 0 = 自动
     @Published var whiteBalanceKelvin: Float = 0    // 0 = 自动
+    @Published var focusLensPosition: Float = -1    // -1 = 自动对焦
 
     @Published var preRecordOn = false { didSet { if oldValue != preRecordOn { syncPreRecord() } } }
     @Published var preRecordDelay: PreRecordDelay = .s15 { didSet { if oldValue != preRecordDelay { syncPreRecord() } } }
@@ -631,6 +636,7 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.isoValue = 0
                 self.shutterSeconds = 0
                 self.whiteBalanceKelvin = 0
+                self.focusLensPosition = -1
             }
             Log.write("[镜头] 翻转 → \(next == .front ? "前置" : "后置")")
         }
@@ -718,6 +724,7 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.isoValue = 0
                 self.shutterSeconds = 0
                 self.whiteBalanceKelvin = 0
+                self.focusLensPosition = -1
             }
             Log.write("[镜头] \(self.fieldOfView.rawValue)")
         }
@@ -782,6 +789,8 @@ final class CameraEngine: NSObject, ObservableObject {
         case .iso: return isoValue > 0
         case .shutter: return shutterSeconds > 0
         case .whiteBalance: return whiteBalanceKelvin > 0
+        case .focus: return focusLensPosition >= 0
+        case .zoom: return zoom > 1.05
         }
     }
 
@@ -803,6 +812,11 @@ final class CameraEngine: NSObject, ObservableObject {
             return lo > 0 && hi > lo ? lo...hi : (1.0 / 8000.0)...(1.0 / 2.0)
         case .whiteBalance:
             return 2500...9000
+        case .focus:
+            return 0...1
+        case .zoom:
+            let hi = min(Double(device.activeFormat.videoMaxZoomFactor), 8.0)
+            return 1.0...max(hi, 1.1)
         }
     }
 
@@ -819,6 +833,10 @@ final class CameraEngine: NSObject, ObservableObject {
         case .whiteBalance:
             if whiteBalanceKelvin > 0 { return Double(whiteBalanceKelvin) }
             return Double(device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains).temperature)
+        case .focus:
+            return focusLensPosition >= 0 ? Double(focusLensPosition) : Double(device.lensPosition)
+        case .zoom:
+            return Double(zoom)
         }
     }
 
@@ -827,10 +845,10 @@ final class CameraEngine: NSObject, ObservableObject {
         let range = proRange(control)
         let value = proEffective(control)
         switch control {
-        case .exposure, .whiteBalance:
+        case .exposure, .whiteBalance, .focus:
             guard range.upperBound > range.lowerBound else { return 0.5 }
             return min(max((value - range.lowerBound) / (range.upperBound - range.lowerBound), 0), 1)
-        case .iso, .shutter:
+        case .iso, .shutter, .zoom:
             guard range.lowerBound > 0, range.upperBound > range.lowerBound, value > 0 else { return 0 }
             let t = (log(value) - log(range.lowerBound)) / (log(range.upperBound) - log(range.lowerBound))
             return min(max(t, 0), 1)
@@ -848,6 +866,10 @@ final class CameraEngine: NSObject, ObservableObject {
             return shutterText(shutterSeconds)
         case .whiteBalance:
             return whiteBalanceKelvin > 0 ? "\(Int(whiteBalanceKelvin))K" : "自动"
+        case .focus:
+            return focusLensPosition >= 0 ? String(format: "%.2f", focusLensPosition) : "自动"
+        case .zoom:
+            return String(format: "%.1fx", zoom)
         }
     }
 
@@ -862,6 +884,10 @@ final class CameraEngine: NSObject, ObservableObject {
             return (shutterText(range.lowerBound), shutterText(range.upperBound))
         case .whiteBalance:
             return ("2500K", "9000K")
+        case .focus:
+            return ("近", "远")
+        case .zoom:
+            return (String(format: "%.1fx", range.lowerBound), String(format: "%.1fx", range.upperBound))
         }
     }
 
@@ -882,6 +908,10 @@ final class CameraEngine: NSObject, ObservableObject {
             shutterSeconds = logValue(range.lowerBound, range.upperBound, clamped)
         case .whiteBalance:
             whiteBalanceKelvin = Float(range.lowerBound + clamped * (range.upperBound - range.lowerBound))
+        case .focus:
+            focusLensPosition = Float(clamped)
+        case .zoom:
+            zoom = CGFloat(logValue(range.lowerBound, range.upperBound, clamped))
         }
         applyPro(control)
     }
@@ -892,8 +922,36 @@ final class CameraEngine: NSObject, ObservableObject {
         case .iso: isoValue = 0
         case .shutter: shutterSeconds = 0
         case .whiteBalance: whiteBalanceKelvin = 0
+        case .focus: focusLensPosition = -1
+        case .zoom: zoom = 1.0
         }
         applyPro(control)
+    }
+
+    /// 点按画面对焦 + 测光
+    func focus(atDevicePoint point: CGPoint) {
+        sessionQueue.async { [weak self] in
+            guard let self = self, let device = self.cameraDevice else { return }
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                let x = min(max(point.x, 0), 1)
+                let y = min(max(point.y, 0), 1)
+                let poi = CGPoint(x: x, y: y)
+                if device.isFocusPointOfInterestSupported {
+                    device.focusPointOfInterest = poi
+                    if device.isFocusModeSupported(.autoFocus) { device.focusMode = .autoFocus }
+                }
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = poi
+                    if device.isExposureModeSupported(.autoExpose) { device.exposureMode = .autoExpose }
+                }
+                // 点按后回到自动对焦，手动滑杆状态同步清掉
+                DispatchQueue.main.async { self.focusLensPosition = -1 }
+            } catch {
+                Log.write("[专业] 点按对焦失败 \(error.localizedDescription)")
+            }
+        }
     }
 
     private func logValue(_ lo: Double, _ hi: Double, _ t: Double) -> Double {
@@ -904,11 +962,30 @@ final class CameraEngine: NSObject, ObservableObject {
     private func applyPro(_ control: ProControl) {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
-            if control == .whiteBalance {
-                self.applyWhiteBalanceLocked()
-            } else {
-                self.applyExposureLocked()
+            switch control {
+            case .whiteBalance: self.applyWhiteBalanceLocked()
+            case .focus: self.applyFocusLocked()
+            case .zoom: self.applyZoomLocked()
+            case .exposure, .shutter, .iso: self.applyExposureLocked()
             }
+        }
+    }
+
+    private func applyFocusLocked() {
+        guard let device = cameraDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if focusLensPosition < 0 {
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
+            } else if device.isFocusModeSupported(.locked) {
+                device.setFocusModeLocked(lensPosition: min(max(focusLensPosition, 0), 1),
+                                          completionHandler: nil)
+            }
+        } catch {
+            Log.write("[专业] 对焦失败 \(error.localizedDescription)")
         }
     }
 
