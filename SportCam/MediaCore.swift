@@ -403,14 +403,16 @@ final class ClipWriter {
     /// 预录历史帧：按 PTS 交错写入
     private func writePreRecorded(video: [CMSampleBuffer], audio: [CMSampleBuffer]) {
         guard let videoTrack = videoInput else { return }
+        let began = Date()
         var videoIndex = 0
         var audioIndex = 0
-        let deadline = Date().addingTimeInterval(8)
+        var rejected = 0
+        let deadline = began.addingTimeInterval(12)
 
         while (videoIndex < video.count || audioIndex < audio.count) && Date() < deadline {
             // 写入器一旦失败立即退出，绝不空等（否则会堵死整个写入队列，导致后续点击无反应）
             if let assetWriter = writer, assetWriter.status != .writing {
-                Log.write("[写入] 预录写入中止 \(assetWriter.error?.localizedDescription ?? "")")
+                Log.write("[写入] 预录写入中止 status=\(assetWriter.status.rawValue) \(assetWriter.error?.localizedDescription ?? "")")
                 break
             }
             let takeVideo: Bool
@@ -428,6 +430,8 @@ final class ClipWriter {
                     if videoTrack.append(video[videoIndex]) {
                         videoWritten += 1
                         lastVideoPTS = presentationTime(video[videoIndex])
+                    } else {
+                        rejected += 1
                     }
                     videoIndex += 1
                 } else {
@@ -438,6 +442,8 @@ final class ClipWriter {
                     if audioTrack.append(audio[audioIndex]) {
                         audioWritten += 1
                         lastAudioPTS = presentationTime(audio[audioIndex])
+                    } else {
+                        rejected += 1
                     }
                     audioIndex += 1
                 } else {
@@ -447,6 +453,8 @@ final class ClipWriter {
                 audioIndex += 1
             }
         }
+        let usedMS = Int(Date().timeIntervalSince(began) * 1000)
+        Log.write("[写入] 预录写入 用时\(usedMS)ms 写v=\(videoWritten) 拒收=\(rejected) 剩v=\(video.count - videoIndex)")
     }
 
     func appendVideo(_ sample: CMSampleBuffer) {

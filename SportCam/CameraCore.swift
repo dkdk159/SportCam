@@ -114,6 +114,15 @@ enum PowerSaveDelay: Int, CaseIterable, Identifiable {
     }
 }
 
+// MARK: - 预录缓冲里的一帧
+/// 关键帧标记在"原始 sample"上判断后再存下来。
+/// 原因是深拷贝（替换 data buffer）可能导致附加信息丢失，直接对拷贝判断关键帧会失真。
+struct EncodedFrame {
+    let sample: CMSampleBuffer
+    let isKey: Bool
+    let time: CMTime
+}
+
 // MARK: - 语音控制
 final class VoiceControl {
     var onStart: (() -> Void)?
@@ -395,9 +404,12 @@ final class CameraEngine: NSObject, ObservableObject {
 
     private var cameraDevice: AVCaptureDevice?
     private var cameraInput: AVCaptureDeviceInput?
-    private var videoRing: RingBuffer<CMSampleBuffer>?
+    private var videoRing: RingBuffer<EncodedFrame>?
     private var audioRing: RingBuffer<CMSampleBuffer>?
-    private var encoderSize = CGSize.zero
+    /// 采集实际交付的画面尺寸（只在这里判断"真实尺寸变化"）
+    private var deliveredSize = CGSize.zero
+    /// 需要强制重建编码器（与"尺寸变化"解耦，避免误判成画面变化而中断录制）
+    private var needEncoderRebuild = false
     private var lastKeyTime = CMTime.invalid
     private var clipIndex = 0
     private var sessionReady = false
@@ -582,10 +594,8 @@ final class CameraEngine: NSObject, ObservableObject {
             self.session.commitConfiguration()
             self.attachConnectionsLocked()
             self.applyFrameRateLocked()
-            self.videoRing?.removeAll()
-            self.audioRing?.removeAll()
-            self.encoderSize = .zero
-            self.lastKeyTime = .invalid
+            self.resetPreRecordBuffers()
+            self.needEncoderRebuild = true
             self.encoder.invalidate()
             DispatchQueue.main.async { self.zoom = 1.0 }
             Log.write("[镜头] \(self.fieldOfView.rawValue)")
@@ -603,10 +613,8 @@ final class CameraEngine: NSObject, ObservableObject {
             self.session.commitConfiguration()
             self.attachConnectionsLocked()
             self.applyFrameRateLocked()
-            self.videoRing?.removeAll()
-            self.audioRing?.removeAll()
-            self.encoderSize = .zero
-            self.lastKeyTime = .invalid
+            self.resetPreRecordBuffers()
+            self.needEncoderRebuild = true
             self.encoder.invalidate()
             Log.write("[会话] \(self.quality.rawValue)")
         }
@@ -646,7 +654,17 @@ final class CameraEngine: NSObject, ObservableObject {
         let fps = max(Double(frameRate.rawValue), 24)
         videoRing = RingBuffer(capacity: Int(fps * Double(seconds)))
         audioRing = RingBuffer(capacity: Int(48 * Double(seconds)))
+        lastKeyTime = .invalid
         Log.write("[缓冲] 预录\(preRecordOn ? "\(seconds)秒" : "关") v\(Int(fps * Double(seconds))) a\(Int(48 * Double(seconds)))")
+    }
+
+    /// 清空预录缓冲。
+    /// 编码器一旦重建，缓冲里的旧帧就是"上一代格式"（SPS/PPS 不同），
+    /// 和新帧混在一起交给 AVAssetWriter 会被大量拒收 → 视频不完整。
+    private func resetPreRecordBuffers() {
+        videoRing?.removeAll()
+        audioRing?.removeAll()
+        lastKeyTime = .invalid
     }
 
     // MARK: 录制
@@ -681,11 +699,11 @@ final class CameraEngine: NSObject, ObservableObject {
                     self.markPendingStart()
                     return
                 }
-                let startTime = presentationTime(window[0])
+                let startTime = window[0].time
                 let audios = (self.audioRing?.snapshot() ?? []).filter {
                     CMTimeCompare(presentationTime($0), startTime) >= 0
                 }
-                self.launchWriter(video: window, audio: audios)
+                self.launchWriter(video: window.map { $0.sample }, audio: audios)
             } else {
                 self.markPendingStart()
             }
@@ -772,19 +790,24 @@ final class CameraEngine: NSObject, ObservableObject {
         let needWrite = recording
         guard needRing || needStart || needWrite else { return }
 
+        // 关键帧标记必须在"原始 sample"上判断（深拷贝替换了 data buffer，附加信息可能丢失）
+        let isKey = sample.isSync
         // 深拷贝，否则回调返回后就是悬垂指针
         guard let frame = sample.deepCopy() else {
             Log.write("[编码] 深拷贝失败")
             return
         }
-        if needRing { videoRing?.append(frame) }
+        let time = presentationTime(frame)
+
+        if needRing {
+            videoRing?.append(EncodedFrame(sample: frame, isKey: isKey, time: time))
+        }
 
         if needStart {
-            guard frame.isSync else { return }
+            guard isKey else { return }
             stateLock.lock(); flagPendingStart = false; stateLock.unlock()
-            let startTime = presentationTime(frame)
             let audios = (audioRing?.snapshot() ?? []).filter {
-                CMTimeCompare(presentationTime($0), startTime) >= 0
+                CMTimeCompare(presentationTime($0), time) >= 0
             }
             Log.write("[录制] 起始关键帧到位 音频\(audios.count)")
             launchWriter(video: [frame], audio: audios)
@@ -793,9 +816,9 @@ final class CameraEngine: NSObject, ObservableObject {
         if needWrite { writer.appendVideo(frame) }
     }
 
-    private static func trimToFirstKeyFrame(_ samples: [CMSampleBuffer]) -> [CMSampleBuffer] {
-        guard let index = samples.firstIndex(where: { $0.isSync }) else { return [] }
-        return Array(samples[index...])
+    private static func trimToFirstKeyFrame(_ frames: [EncodedFrame]) -> [EncodedFrame] {
+        guard let index = frames.firstIndex(where: { $0.isKey }) else { return [] }
+        return Array(frames[index...])
     }
 
     private func nextClipURL() -> URL {
@@ -810,14 +833,14 @@ final class CameraEngine: NSObject, ObservableObject {
     /// 录制启动超时（8 秒没进入写入状态）→ 复位，避免"点了没反应"
     private func armWatchdog() {
         disarmWatchdog()
-        watchdog = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { [weak self] _ in
+        watchdog = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: false) { [weak self] _ in
             guard let self = self else { return }
             self.stateLock.lock()
             let neverLive = self.flagStarting || !self.flagLive
             let wanted = self.flagRecording
             self.stateLock.unlock()
             guard neverLive, wanted else { return }
-            Log.write("[录制] 启动超时8秒，复位")
+            Log.write("[录制] 启动超时15秒，复位")
             self.writer.cancel()
             self.fail("录像启动超时，请看日志")
         }
@@ -828,7 +851,7 @@ final class CameraEngine: NSObject, ObservableObject {
         watchdog = nil
     }
 
-    /// 运行期看门狗：画面停了救采集；画面在动却没编码输出就重建编码器
+    /// 运行期看门狗：画面停了救采集；"该编码却没输出"才重建编码器
     private func runWatchdogs() {
         let now = Date()
 
@@ -840,7 +863,11 @@ final class CameraEngine: NSObject, ObservableObject {
             }
         }
 
-        if let last = lastFrameAt, now.timeIntervalSince(last) < 1.5,
+        // 只有"本来就该编码"的时候才检查编码输出。
+        // 预录关闭且未录制时我们是故意不编码的（省电省发热），
+        // 这种正常状态过去被误判成故障，导致编码器被反复重建 —— 曾引发录制中途被强行停止。
+        let shouldEncode = preRecordOn || recording || pendingStart
+        if shouldEncode, let last = lastFrameAt, now.timeIntervalSince(last) < 1.5,
            now.timeIntervalSince(lastEncodeAt) > 3 {
             if now.timeIntervalSince(lastEncoderRescue) > 3 {
                 lastEncoderRescue = now
@@ -848,9 +875,10 @@ final class CameraEngine: NSObject, ObservableObject {
                 sessionQueue.async { [weak self] in
                     guard let self = self else { return }
                     self.encoder.invalidate()
-                    self.encoderSize = .zero
+                    self.needEncoderRebuild = true
                     self.lastEncoderTry = .distantPast
-                    self.lastKeyTime = .invalid
+                    // 编码器换代后旧帧格式不兼容，必须清掉
+                    self.resetPreRecordBuffers()
                 }
             }
         }
@@ -871,11 +899,13 @@ final class CameraEngine: NSObject, ObservableObject {
     private func startVoice() {
         stateLock.lock(); flagVoice = true; stateLock.unlock()
         voice.setWords(start: startWords, stop: stopWords)
+        Log.write("[语音] 开关打开，开始监听")
         voice.begin()
     }
 
     private func stopVoice() {
         stateLock.lock(); flagVoice = false; stateLock.unlock()
+        Log.write("[语音] 开关关闭")
         voice.end()
     }
 
@@ -966,14 +996,15 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
+        let size = CGSize(width: width, height: height)
 
-        let sizeChanged = encoderSize != CGSize(width: width, height: height)
-        if sizeChanged {
-            encoderSize = CGSize(width: width, height: height)
-            videoRing?.removeAll()
-            audioRing?.removeAll()
-            lastKeyTime = .invalid
+        // 只有"采集交付的真实尺寸"变化（切镜头/换分辨率）才走这里。
+        // 编码器重建不再借用这个分支，避免把内部重配误判成画面变化而中断录制。
+        if deliveredSize != size {
+            deliveredSize = size
+            resetPreRecordBuffers()
             encoder.invalidate()
+            needEncoderRebuild = true
             if recording {
                 Log.write("[采集] 录制中画面尺寸变化，停止本次录制")
                 DispatchQueue.main.async { self.stopRecording() }
@@ -985,14 +1016,17 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
         let needEncode = preRecordOn || recording || pendingStart
         guard needEncode else { return }
 
-        // 编码器缺失（创建失败或被回收）自动重建，1 秒最多一次
-        if sizeChanged || !encoder.isReady {
+        // 需要重建 / 创建失败 / 被系统回收 → 重建，1 秒最多一次
+        if needEncoderRebuild || !encoder.isReady {
             let now = Date()
-            if sizeChanged || now.timeIntervalSince(lastEncoderTry) > 1.0 {
+            if needEncoderRebuild || now.timeIntervalSince(lastEncoderTry) > 1.0 {
                 lastEncoderTry = now
+                needEncoderRebuild = false
                 encoder.configure(width: width, height: height,
                                   fps: frameRate.rawValue,
                                   bitrate: max(width * height * 3, 6_000_000))
+                // 编码器换代 → 缓冲里的旧帧格式不兼容，必须清掉
+                resetPreRecordBuffers()
             }
         }
         guard encoder.isReady else { return }
