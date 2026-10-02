@@ -748,9 +748,9 @@ final class CameraEngine: NSObject, ObservableObject {
         }
         resetPowerTimer()
 
-        recorder.endClip { [weak self] segments in
+        recorder.endClip { [weak self] clip in
             guard let self = self else { return }
-            guard !segments.isEmpty else {
+            guard !clip.segments.isEmpty else {
                 DispatchQueue.main.async {
                     self.isBusy = false
                     self.message("没有录到画面，请重试")
@@ -758,8 +758,9 @@ final class CameraEngine: NSObject, ObservableObject {
                 return
             }
             let output = self.nextClipURL()
-            SegmentMerger.merge(segments, to: output) { ok in
-                for seg in segments { try? FileManager.default.removeItem(at: seg.url) }
+            SegmentMerger.merge(clip, to: output) { ok in
+                for seg in clip.segments { try? FileManager.default.removeItem(at: seg.url) }
+                if let audio = clip.audio { try? FileManager.default.removeItem(at: audio.url) }
                 guard ok else {
                     DispatchQueue.main.async {
                         self.isBusy = false
@@ -771,7 +772,7 @@ final class CameraEngine: NSObject, ObservableObject {
                     try? FileManager.default.removeItem(at: output)
                     DispatchQueue.main.async {
                         self.isBusy = false
-                        self.message(saved ? "已保存到相册 · 共\(segments.count)段" : "保存相册失败（检查相册权限）")
+                        self.message(saved ? "已保存到相册 · 共\(clip.segments.count)段" : "保存相册失败（检查相册权限）")
                     }
                 }
             }
