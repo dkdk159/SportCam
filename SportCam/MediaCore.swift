@@ -653,7 +653,7 @@ struct RecordedClip {
 ///   initWithAsset:presetName: / setOutputFileType: / setShouldOptimizeForNetworkUse: /
 ///   exportAsynchronouslyWithCompletionHandler:
 enum SegmentMerger {
-    /// - Parameter watermark: 非空时把「时间 + 地点」烧进画面（必须重编码）；
+    /// - Parameter watermark: 非空时把水印（时间/地点/描述/海拔/天气…）烧进画面（必须重编码）；
     ///                        nil 时保持原样的无损 Passthrough。
     static func merge(_ clip: RecordedClip, to output: URL,
                       watermark: WatermarkConfig? = nil,

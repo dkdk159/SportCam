@@ -424,10 +424,14 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var voiceOn = true { didSet { if oldValue != voiceOn { voiceOn ? startVoice() : stopVoice() } } }
     @Published var startWords = ["开始录像", "开启录像", "开始录制", "开始拍摄"]
     @Published var stopWords = ["停止录像", "结束录像", "关闭录像", "停止录制", "保存"]
-    /// 时间地点水印：独立功能，打开才定位、才写进视频
+    /// 水印：独立功能，打开才定位、才取天气、才写进视频
     @Published var watermarkOn = false { didSet { if oldValue != watermarkOn { syncWatermark() } } }
-    /// 当前地名（开启水印后由定位反查得到）
-    @Published var watermarkPlace = ""
+    /// 水印里显示哪几项（时间/地点/描述/海拔/天气/温度/气压/风速）
+    @Published var watermarkItems: Set<WatermarkItem> = WatermarkItem.default {
+        didSet { if oldValue != watermarkItems { saveWatermarkSettings() } }
+    }
+    /// 水印数据：地点 / 海拔 / 天气…，定位和天气各填一半，谁先回来谁先显示
+    @Published var watermarkData = WatermarkData()
     /// 定位异常提示（只在设置页显示，不会写进视频）
     @Published var locationNote = ""
 
@@ -449,6 +453,7 @@ final class CameraEngine: NSObject, ObservableObject {
     private let recorder = SegmentRecorder()
     private let sound = SoundPlayer()
     private let locator = LocationProvider()
+    private let weather = WeatherProvider()
     private let voice = VoiceControl()
     private let power = PowerMonitor()
 
@@ -500,23 +505,46 @@ final class CameraEngine: NSObject, ObservableObject {
     func launch() {
         configureAudioSession()
         level.start()
-        refreshZoomChips()          // 先按机型的镜头算好焦段档位（没有超广角就不显示 0.5x）
+        loadWatermarkSettings()     // 上次勾的水印项和自定义描述
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
 
         recorder.onSegmentsChanged = { [weak self] total in
             self?.segmentCount = total
         }
 
-        // 地名只在水印开着时才需要
+        // 地名/海拔/天气只在水印开着时才需要
         locator.onPlace = { [weak self] text in
-            guard let self = self, self.watermarkPlace != text else { return }
-            self.watermarkPlace = text
+            guard let self = self, self.watermarkData.place != text else { return }
+            var data = self.watermarkData
+            data.place = text
+            self.watermarkData = data
             self.locationNote = ""
             Log.write("[水印] 地点：\(text)")
         }
+        locator.onFix = { [weak self] coordinate, altitude, hasAltitude in
+            guard let self = self else { return }
+            var data = self.watermarkData
+            if hasAltitude {
+                data.altitude = altitude
+                data.hasAltitude = true
+            }
+            self.watermarkData = data
+            self.weather.fetch(coordinate)
+        }
         locator.onFailure = { [weak self] reason in
-            // 只提示在设置页，绝不写进 watermarkPlace —— 否则"定位失败"会被烧进视频
+            // 只提示在设置页，绝不写进 watermarkData —— 否则"定位失败"会被烧进视频
             self?.locationNote = reason
+        }
+        weather.onUpdate = { [weak self] snap in
+            guard let self = self, snap.valid else { return }
+            var data = self.watermarkData
+            data.weather = snap.text
+            data.temperature = snap.temperature
+            data.pressure = snap.pressure
+            data.wind = snap.wind
+            data.hasWeather = true
+            self.watermarkData = data
+            Log.write("[水印] 天气：\(snap.text) \(Int(snap.temperature))℃")
         }
 
         uiTimer?.invalidate()
@@ -746,7 +774,6 @@ final class CameraEngine: NSObject, ObservableObject {
                 // 先落 cameraPosition 再落 fieldOfView：前者已是 .front 时，
                 // fieldOfView 的 didSet 会走 switchLens，被"前置不支持切换焦段"挡掉，正好不动会话
                 self.fieldOfView = fov
-                self.refreshZoomChips()     // 前置没有超广角，0.5x 档要跟着收起来
                 self.torchOn = false        // 上面已经把灯关了，按钮同步灭掉
                 self.zoom = 1.0
                 self.exposureBias = 0
@@ -941,37 +968,30 @@ final class CameraEngine: NSObject, ObservableObject {
         default:     fov = .wide;      factor = 1.0
         }
 
-        // 前置摄像头、或本机根本没有这颗镜头（如 iPhone 8 Plus 没有超广角）：
-        // 只在当前镜头上改倍数，不动会话。
-        guard cameraPosition == .back, lensDevice(fov) != nil else {
-            zoom = factor
+        // 0.5x 要超广角：本机没有（比如 iPhone 8 Plus 只有广角+长焦）、或者在前置，都做不了，直说
+        if fov == .ultraWide, cameraPosition != .back || lensDevice(.ultraWide) == nil {
+            message("本机没有超广角镜头，用不了 0.5x")
+            return
+        }
+
+        guard cameraPosition == .back else {
+            zoom = factor                  // 前置没有多摄，直接在广角上做数字变焦
             return
         }
 
         if fieldOfView == fov {
-            // 1x ↔ 2x 都在广角这颗镜头上：直接斜坡过去，中间没有任何黑帧
-            zoom = factor
+            zoom = factor                  // 同一颗镜头内（1x ↔ 2x）：只改变焦倍数，不重建会话，无黑帧
         } else {
-            // 真要换镜头：先把目标倍数放好，切完镜头由 switchLens 套用
-            pendingZoom = factor
+            pendingZoom = factor           // 真要换镜头：切完由 switchLens 套用
             fieldOfView = fov
         }
     }
 
-    /// 本机当前可用的焦段档位。
-    /// 没有超广角就不摆 0.5x —— 系统相机也是这么做的，否则会出现"点得动但画面没反应"的假按钮。
-    /// 只在启动和翻转时算一次：查设备（AVCaptureDevice.default）不适合每帧都跑。
-    @Published var zoomChips: [String] = ["1x", "2x"]
+    /// 焦段档位：0.5x / 1x / 2x 三档固定摆出来。
+    /// 本机没有超广角时点 0.5x 会明确提示，而不是默默没反应。
+    let zoomChips = ["0.5x", "1x", "2x"]
 
-    func refreshZoomChips() {
-        var chips: [String] = []
-        if cameraPosition == .back, lensDevice(.ultraWide) != nil { chips.append("0.5x") }
-        chips.append("1x")
-        chips.append("2x")
-        zoomChips = chips
-    }
-
-    /// 本机后置真实存在的镜头。没有超广角/长焦的机型不摆出来，免得选了没反应。
+    /// 本机后置真实存在的镜头。设置里的「视角」只列有的，免得选了没反应。
     var availableFieldOfViews: [FieldOfView] {
         FieldOfView.allCases.filter { lensDevice($0) != nil }
     }
@@ -1366,17 +1386,69 @@ final class CameraEngine: NSObject, ObservableObject {
         recorder.arm(preRecordSeconds: Double(preRecordDelay.rawValue))
     }
 
-    /// 水印开关：打开才开始定位，关掉立刻停，不留后台定位
+    /// 水印总开关：打开才开始定位 / 取天气，关掉立刻停，不留后台定位
     private func syncWatermark() {
         if watermarkOn {
             Log.write("[水印] 开启")
-            locator.start()
+            ensureWatermarkStarted()
         } else {
             locator.stop()
-            watermarkPlace = ""
+            weather.cancel()
             locationNote = ""
             Log.write("[水印] 关闭")
         }
+    }
+
+    /// 启动定位 / 天气（幂等）。水印面板打开、或勾选任意一项时也会调，
+    /// 保证"点一下就马上有数据"，不用开关两次。
+    func ensureWatermarkStarted() {
+        guard watermarkOn else { return }
+        locator.start()
+    }
+
+    /// 勾选 / 取消某一项。勾选时顺手把总开关打开 —— 和参考 App 一样，点一下水印就出现。
+    func toggleWatermarkItem(_ item: WatermarkItem, on: Bool) {
+        var items = watermarkItems
+        if on { items.insert(item) } else { items.remove(item) }
+        watermarkItems = items
+        if on && !watermarkOn { watermarkOn = true } else { ensureWatermarkStarted() }
+    }
+
+    /// 当前水印的每一行文本。预览和烧录共用同一套拼法，保证所见即所得。
+    func watermarkLines(at date: Date) -> [String] {
+        WatermarkComposer.lines(date: date, data: watermarkData, items: watermarkItems)
+    }
+
+    /// 面板里某一项右侧显示的当前值
+    func watermarkValue(_ item: WatermarkItem) -> String {
+        WatermarkComposer.value(of: item, data: watermarkData)
+    }
+
+    func setWatermarkDesc(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var data = watermarkData
+        data.desc = trimmed
+        watermarkData = data
+        UserDefaults.standard.set(trimmed, forKey: CameraEngine.descKey)
+    }
+
+    private static let itemsKey = "sportcam.watermark.items"
+    private static let descKey = "sportcam.watermark.desc"
+
+    private func saveWatermarkSettings() {
+        UserDefaults.standard.set(watermarkItems.map { $0.rawValue }, forKey: CameraEngine.itemsKey)
+    }
+
+    private func loadWatermarkSettings() {
+        let store = UserDefaults.standard
+        if let raw = store.array(forKey: CameraEngine.itemsKey) as? [String] {
+            watermarkItems = Set(raw.compactMap { WatermarkItem(rawValue: $0) })
+        }
+        var data = watermarkData
+        if let text = store.string(forKey: CameraEngine.descKey), !text.isEmpty {
+            data.desc = text
+        }
+        watermarkData = data
     }
 
     // MARK: 录制
@@ -1442,7 +1514,8 @@ final class CameraEngine: NSObject, ObservableObject {
             let output = self.nextClipURL()
             // 水印：视频第 0 秒 = 最早那段开始写盘的真实时刻
             let mark: WatermarkConfig? = self.watermarkOn ? WatermarkConfig(
-                place: self.watermarkPlace,
+                data: self.watermarkData,
+                items: self.watermarkItems,
                 startDate: clip.segments.map { $0.createdAt }.min() ?? Date()
             ) : nil
             SegmentMerger.merge(clip, to: output, watermark: mark) { ok in

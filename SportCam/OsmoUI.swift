@@ -128,24 +128,19 @@ private struct ZoomChip: View {
 }
 
 /// 预览上的水印：只是位置示意，真正烧进视频的那一份在导出时绘制。
-/// 只有设置里打开「时间地点水印」才出现在画面上。
+/// 行内容由引擎按当前勾选项拼好，和烧录共用同一套拼法。
 private struct WatermarkPreview: View {
-    let place: String
+    @ObservedObject var engine: CameraEngine
     let bottomInset: CGFloat
     @State private var now = Date()
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
-    private static let formatter: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "zh_CN")
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return f
-    }()
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(WatermarkPreview.formatter.string(from: now))
-            if !place.isEmpty { Text(place) }
+        let lines = engine.watermarkLines(at: now)
+        return VStack(alignment: .leading, spacing: 1) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                Text(line)
+            }
         }
         .font(.system(size: 12, weight: .semibold))
         .foregroundColor(.white)
@@ -282,6 +277,8 @@ struct CameraScreen: View {
     @State private var showSettings = false
     @State private var showDuration = false
     @State private var showFormat = false
+    @State private var showWatermark = false
+    @State private var showDescEdit = false
     @State private var pinching = false
     @State private var zoomBase: CGFloat = 1.0
     @State private var focusReticle: CGPoint?
@@ -313,9 +310,9 @@ struct CameraScreen: View {
 
             if engine.showGrid { GridOverlay().ignoresSafeArea() }
 
-            // 水印：开关打开才显示，位置对齐最终烧进视频的左下角
+            // 水印：开启才显示，位置对齐最终烧进视频的左下角
             if engine.watermarkOn {
-                WatermarkPreview(place: engine.watermarkPlace,
+                WatermarkPreview(engine: engine,
                                  bottomInset: engine.proControl != nil ? 300 : 148)
             }
 
@@ -405,6 +402,7 @@ struct CameraScreen: View {
 
             if showDuration && engine.proControl == nil { durationPicker }
             if showFormat && engine.proControl == nil { formatPicker }
+            if showWatermark { watermarkPicker }
         }
         .onAppear { engine.launch() }
         .statusBar(hidden: true)
@@ -703,6 +701,135 @@ struct CameraScreen: View {
         .opacity(engine.isRecording ? 0.5 : 1)
     }
 
+    // MARK: 水印面板（逐项勾选，勾上立刻出现在画面上；卡片靠上，不挡左下角的水印预览）
+    private var watermarkPicker: some View {
+        ZStack {
+            Color.black.opacity(0.5)
+                .ignoresSafeArea()
+                .onTapGesture { showWatermark = false }
+
+            VStack(spacing: 0) {
+                Spacer().frame(height: 76)
+                card
+                Spacer()
+            }
+        }
+        .sheet(isPresented: $showDescEdit) {
+            DescEditorView(initial: engine.watermarkData.desc) { engine.setWatermarkDesc($0) }
+        }
+    }
+
+    private var card: some View {
+        VStack(spacing: 14) {
+            // 总开关
+            HStack(spacing: 0) {
+                watermarkMaster("关闭", on: !engine.watermarkOn) { engine.watermarkOn = false }
+                watermarkMaster("开启", on: engine.watermarkOn) { engine.watermarkOn = true }
+            }
+            .padding(4)
+            .background(Color.white.opacity(0.12))
+            .clipShape(Capsule())
+
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(Array(WatermarkItem.allCases.enumerated()), id: \.element.id) { index, item in
+                        watermarkRow(item)
+                        if index < WatermarkItem.allCases.count - 1 {
+                            Divider().background(Color.white.opacity(0.10))
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 268)
+
+            Text("数据来自系统定位与 Open-Meteo 天气，勾上即刻显示")
+                .font(.system(size: 11))
+                .foregroundColor(.white.opacity(0.5))
+
+            Button {
+                showWatermark = false
+            } label: {
+                Text("完成")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.black)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 40)
+                    .background(Color.white)
+                    .cornerRadius(10)
+            }
+            .buttonStyle(PlainButtonStyle())
+        }
+        .padding(18)
+        .frame(maxWidth: 340)
+        .background(Color(red: 0.15, green: 0.15, blue: 0.16))
+        .cornerRadius(16)
+    }
+
+    private func watermarkMaster(_ title: String, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(on ? .black : .white.opacity(0.8))
+                .frame(maxWidth: .infinity)
+                .frame(height: 36)
+                .background(on ? Color.white : Color.clear)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+
+    private func watermarkRow(_ item: WatermarkItem) -> some View {
+        let on = engine.watermarkItems.contains(item)
+        return HStack(spacing: 10) {
+            Button {
+                engine.toggleWatermarkItem(item, on: !on)
+            } label: {
+                ZStack {
+                    Capsule()
+                        .fill(on ? Palette.accent : Color.white.opacity(0.22))
+                        .frame(width: 42, height: 25)
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: 21, height: 21)
+                        .offset(x: on ? 8.5 : -8.5)
+                }
+                .animation(.easeOut(duration: 0.16), value: on)
+            }
+            .buttonStyle(PlainButtonStyle())
+
+            Text(item.rawValue)
+                .font(.system(size: 14))
+                .foregroundColor(.white)
+                .frame(width: 42, alignment: .leading)
+
+            Spacer(minLength: 8)
+
+            if item == .desc {
+                Button {
+                    showDescEdit = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(engine.watermarkValue(item))
+                            .lineLimit(1)
+                        Image(systemName: "pencil")
+                            .font(.system(size: 10))
+                    }
+                    .font(.system(size: 12))
+                    .foregroundColor(.white.opacity(0.85))
+                }
+                .buttonStyle(PlainButtonStyle())
+            } else {
+                Text(engine.watermarkValue(item))
+                    .font(.system(size: 12))
+                    .foregroundColor(.white.opacity(0.6))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .padding(.vertical, 11)
+        .contentShape(Rectangle())
+    }
+
     // MARK: 底部（变焦胶囊 / 快门行 + 参数按钮）
     private var bottomBar: some View {
         VStack(spacing: 14) {
@@ -714,7 +841,7 @@ struct CameraScreen: View {
 
     private var zoomPill: some View {
         HStack(spacing: 4) {
-            // 档位由引擎按机型给：没有超广角就没有 0.5x，不摆点不动的假按钮
+            // 三档固定摆出来；本机没有超广角时点 0.5x 会提示
             ForEach(engine.zoomChips, id: \.self) { chip in
                 ZoomChip(label: chip, selected: engine.isZoomChipSelected(chip)) {
                     engine.selectZoomChip(chip)
@@ -725,35 +852,47 @@ struct CameraScreen: View {
         .padding(4)
         .background(Color.black.opacity(0.45))
         .clipShape(Capsule())
-        .animation(.easeOut(duration: 0.18), value: engine.zoomChips.count)
     }
 
     private var shutterRow: some View {
-        HStack(spacing: 0) {
-            // 左侧：相册 + 专业参数
+        ZStack {
+            // 快门永远钉在屏幕正中央
+            shutterButton
+
             HStack(spacing: 14) {
+                // 左：相册 + 专业参数
                 CircleIcon(icon: "photo.on.rectangle", diameter: 46) {
                     engine.openPhotos()
                 }
                 proToggleButton
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
 
-            // 快门永远钉在屏幕正中央
-            shutterButton
+                Spacer(minLength: 8)
 
-            // 右侧：水印开关 + 预录时长入口（预录开关在顶部胶囊上点）
-            HStack(spacing: 14) {
-                CircleIcon(icon: "textformat",
-                           active: engine.watermarkOn,
-                           diameter: 46) {
-                    engine.watermarkOn.toggle()
-                }
+                // 右：水印 + 预录时长
+                watermarkButton
                 CircleIcon(icon: "timer", diameter: 46) { showDuration = true }
             }
-            .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(.horizontal, 20)
+    }
+
+    /// 水印：点开面板，逐项勾选（时间/地点/描述/海拔/天气/温度/气压/风速）
+    private var watermarkButton: some View {
+        Button {
+            showWatermark = true
+            engine.ensureWatermarkStarted()
+        } label: {
+            Text("水印时间")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(engine.watermarkOn ? .black : .white)
+                .padding(.horizontal, 13)
+                .frame(height: 46)
+                .background(engine.watermarkOn ? Palette.accent : Palette.glass)
+                .clipShape(Capsule())
+                .overlay(Capsule().stroke(engine.watermarkOn ? Color.clear : Palette.border, lineWidth: 0.5))
+                .animation(.easeOut(duration: 0.18), value: engine.watermarkOn)
+        }
+        .buttonStyle(PlainButtonStyle())
     }
 
     /// 一个按钮管全部专业参数：点开面板，里面六项随便切
@@ -915,6 +1054,32 @@ struct CameraScreen: View {
     }
 }
 
+/// 水印「描述」那一行的编辑页
+private struct DescEditorView: View {
+    let initial: String
+    let onSave: (String) -> Void
+    @Environment(\.presentationMode) private var presentation
+    @State private var text = ""
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("水印描述"),
+                        footer: Text("这一行会原样写进水印，例如「钓鱼运动相机」。留空则不显示。")) {
+                    TextField("输入描述", text: $text)
+                }
+            }
+            .navigationBarTitle("描述", displayMode: .inline)
+            .navigationBarItems(leading: Button("取消") { presentation.wrappedValue.dismiss() },
+                                trailing: Button("保存") {
+                                    onSave(text)
+                                    presentation.wrappedValue.dismiss()
+                                })
+        }
+        .onAppear { text = initial }
+    }
+}
+
 // MARK: - 设置
 struct SettingsSheet: View {
     @ObservedObject var engine: CameraEngine
@@ -950,15 +1115,23 @@ struct SettingsSheet: View {
                 }
 
                 Section(header: Text("水印"),
-                        footer: Text("开启后会把「时间 + 地点」烧进视频左下角，预览上同款显示。需要定位权限；关闭时完全不定位、不写入画面。")) {
+                        footer: Text("开启后会把水印烧进视频左下角，预览上同款显示。需要定位权限、天气需要联网；关闭时完全不定位、不联网、不写入画面。\n要显示哪些内容，在拍摄界面右下角的「水印时间」里逐项勾选。")) {
                     Toggle("时间地点水印", isOn: $engine.watermarkOn)
                     if engine.watermarkOn {
                         HStack {
                             Text("当前地点")
                             Spacer()
-                            Text(engine.watermarkPlace.isEmpty
+                            Text(engine.watermarkData.place.isEmpty
                                  ? (engine.locationNote.isEmpty ? "定位中…" : engine.locationNote)
-                                 : engine.watermarkPlace)
+                                 : engine.watermarkData.place)
+                                .foregroundColor(.secondary)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.trailing)
+                        }
+                        HStack {
+                            Text("天气数据")
+                            Spacer()
+                            Text(engine.watermarkData.hasWeather ? "已就绪" : "获取中…")
                                 .foregroundColor(.secondary)
                         }
                     }
