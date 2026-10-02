@@ -487,82 +487,177 @@ final class SegmentRecorder {
     }
 }
 
-// MARK: - 分段合并（无损 passthrough）
+// MARK: - 分段合并
+/// 逐样本读取 + 重排时间戳 + 无损写入。
+///
+/// 之前用 AVMutableComposition 按"每段总时长"顺序拼接，段与段之间会差一两帧
+/// （每段的 asset.duration 含不含末帧时长、音频轨比视频轨短一点等），
+/// 接缝处就会停顿或跳帧 —— 看起来"一段一段"的。
+/// 现在改成自己控制输出时间轴：把每段的样本起点对齐到上一段的结束点，
+/// 逐帧重排 PTS 后写入，接缝处零间隙，且只搬样本、不重新编码。
 enum SegmentMerger {
     static func merge(_ urls: [URL], to output: URL, completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = concat(urls, to: output)
+            DispatchQueue.main.async { completion(ok) }
+        }
+    }
+
+    private static func concat(_ urls: [URL], to output: URL) -> Bool {
         let valid = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
         guard !valid.isEmpty else {
-            Log.write("[合并] 没有可用的分段")
-            completion(false)
-            return
+            Log.write("[合并] 没有可用分段")
+            return false
         }
-        // 只有一段：直接当成品用
         if valid.count == 1 {
             do {
-                if FileManager.default.fileExists(atPath: output.path) { try? FileManager.default.removeItem(at: output) }
+                try? FileManager.default.removeItem(at: output)
                 try FileManager.default.copyItem(at: valid[0], to: output)
                 Log.write("[合并] 单段，直接使用")
-                completion(true)
+                return true
             } catch {
                 Log.write("[合并] 复制失败 \(error.localizedDescription)")
-                completion(false)
+                return false
             }
-            return
         }
 
-        let composition = AVMutableComposition()
-        let videoTrack = composition.addMutableTrack(withMediaType: .video,
-                                                     preferredTrackID: kCMPersistentTrackID_Invalid)
-        let audioTrack = composition.addMutableTrack(withMediaType: .audio,
-                                                     preferredTrackID: kCMPersistentTrackID_Invalid)
+        // 从第一段取视频/音频格式（合并时直接沿用，不重新编码）
+        let firstAsset = AVURLAsset(url: valid[0])
+        guard let videoFormat = readSamples(firstAsset, media: .video).first
+            .flatMap({ CMSampleBufferGetFormatDescription($0) }) else {
+            Log.write("[合并] 读不到视频格式")
+            return false
+        }
+        let audioFormat = readSamples(firstAsset, media: .audio).first
+            .flatMap({ CMSampleBufferGetFormatDescription($0) })
+
+        try? FileManager.default.removeItem(at: output)
+        guard let writer = try? AVAssetWriter(outputURL: output, fileType: .mp4) else {
+            Log.write("[合并] 创建写入器失败")
+            return false
+        }
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: videoFormat)
+        videoInput.expectsMediaDataInRealTime = false
+        guard writer.canAdd(videoInput) else {
+            Log.write("[合并] 无法添加视频轨")
+            return false
+        }
+        writer.add(videoInput)
+
+        var audioInput: AVAssetWriterInput?
+        if let audioFormat = audioFormat {
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: audioFormat)
+            input.expectsMediaDataInRealTime = false
+            if writer.canAdd(input) {
+                writer.add(input)
+                audioInput = input
+            }
+        }
+
+        guard writer.startWriting() else {
+            Log.write("[合并] startWriting 失败 \(writer.error?.localizedDescription ?? "")")
+            return false
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        let began = Date()
         var cursor = CMTime.zero
-        var insertedVideo = 0
+        var videoCount = 0
+        var audioCount = 0
 
         for url in valid {
             let asset = AVURLAsset(url: url)
-            let duration = asset.duration
-            guard duration.isValid, CMTimeCompare(duration, .zero) > 0 else { continue }
-            let range = CMTimeRange(start: .zero, duration: duration)
-            if let track = asset.tracks(withMediaType: .video).first, let target = videoTrack {
-                do {
-                    try target.insertTimeRange(range, of: track, at: cursor)
-                    insertedVideo += 1
-                } catch {
-                    Log.write("[合并] 插入视频段失败 \(error.localizedDescription)")
+            let videos = readSamples(asset, media: .video)
+            guard let head = videos.first else { continue }
+            let base = presentationTime(head)
+            let audios = audioInput == nil ? [] : readSamples(asset, media: .audio)
+
+            // 本段时长 = 末帧结束 − 段起点；下一段就从这里接着排，保证零间隙
+            var lastEnd = base
+            for sample in videos {
+                let end = CMTimeAdd(presentationTime(sample), CMSampleBufferGetDuration(sample))
+                if CMTimeCompare(end, lastEnd) > 0 { lastEnd = end }
+            }
+            let limit = CMTimeAdd(cursor, CMTimeSubtract(lastEnd, base))
+
+            var jobs: [(CMTime, Bool, CMSampleBuffer)] = []
+            for sample in videos {
+                let shifted = CMTimeAdd(cursor, CMTimeSubtract(presentationTime(sample), base))
+                if let retimed = retime(sample, to: shifted) { jobs.append((shifted, true, retimed)) }
+            }
+            for sample in audios {
+                let shifted = CMTimeAdd(cursor, CMTimeSubtract(presentationTime(sample), base))
+                // 落在本段窗口外的音频丢掉，避免和相邻段重叠
+                if CMTimeCompare(shifted, cursor) < 0 || CMTimeCompare(shifted, limit) >= 0 { continue }
+                if let retimed = retime(sample, to: shifted) { jobs.append((shifted, false, retimed)) }
+            }
+            jobs.sort { CMTimeCompare($0.0, $1.0) < 0 }
+
+            for (_, isVideo, sample) in jobs {
+                guard let target = isVideo ? videoInput : audioInput else { continue }
+                waitReady(target)
+                if target.append(sample) {
+                    if isVideo { videoCount += 1 } else { audioCount += 1 }
                 }
             }
-            if let track = asset.tracks(withMediaType: .audio).first, let target = audioTrack {
-                try? target.insertTimeRange(range, of: track, at: cursor)
-            }
-            cursor = CMTimeAdd(cursor, duration)
+            cursor = limit
         }
 
-        guard insertedVideo > 0 else {
-            Log.write("[合并] 没有任何视频段被插入")
-            completion(false)
-            return
+        guard videoCount > 0 else {
+            Log.write("[合并] 没有可写入的视频样本")
+            writer.cancelWriting()
+            return false
         }
 
-        guard let exporter = AVAssetExportSession(asset: composition,
-                                                  presetName: AVAssetExportPresetPassthrough) else {
-            Log.write("[合并] 无法创建导出会话")
-            completion(false)
-            return
+        videoInput.markAsFinished()
+        audioInput?.markAsFinished()
+        let done = DispatchSemaphore(value: 0)
+        writer.finishWriting { done.signal() }
+        done.wait()
+
+        let ok = writer.status == .completed
+        let usedMS = Int(Date().timeIntervalSince(began) * 1000)
+        if ok {
+            let seconds = String(format: "%.1f", CMTimeGetSeconds(cursor))
+            Log.write("[合并] 成功 \(valid.count)段 v=\(videoCount) a=\(audioCount) 时长\(seconds)秒 用时\(usedMS)ms")
+        } else {
+            Log.write("[合并] 失败 status=\(writer.status.rawValue) \(writer.error?.localizedDescription ?? "")")
         }
-        if FileManager.default.fileExists(atPath: output.path) { try? FileManager.default.removeItem(at: output) }
-        exporter.outputURL = output
-        exporter.outputFileType = .mp4
-        exporter.shouldOptimizeForNetworkUse = false
-        let began = Date()
-        exporter.exportAsynchronously {
-            let ok = exporter.status == .completed
-            let ms = Int(Date().timeIntervalSince(began) * 1000)
-            if ok {
-                Log.write("[合并] 成功 \(valid.count)段 用时\(ms)ms")
-            } else {
-                Log.write("[合并] 失败 status=\(exporter.status.rawValue) \(exporter.error?.localizedDescription ?? "")")
-            }
-            DispatchQueue.main.async { completion(ok) }
+        return ok
+    }
+
+    private static func readSamples(_ asset: AVURLAsset, media: AVMediaType) -> [CMSampleBuffer] {
+        guard let track = asset.tracks(withMediaType: media).first,
+              let reader = try? AVAssetReader(asset: asset) else { return [] }
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        output.alwaysCopiesSampleData = true
+        guard reader.canAdd(output) else { return [] }
+        reader.add(output)
+        guard reader.startReading() else { return [] }
+        var samples: [CMSampleBuffer] = []
+        while let sample = output.copyNextSampleBuffer() { samples.append(sample) }
+        reader.cancelReading()
+        return samples
+    }
+
+    private static func retime(_ sample: CMSampleBuffer, to time: CMTime) -> CMSampleBuffer? {
+        var timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(sample),
+                                        presentationTimeStamp: time,
+                                        decodeTimeStamp: .invalid)
+        var output: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
+                                                           sampleBuffer: sample,
+                                                           sampleTimingEntryCount: 1,
+                                                           sampleTimingArray: &timing,
+                                                           sampleBufferOut: &output)
+        return status == noErr ? output : nil
+    }
+
+    private static func waitReady(_ input: AVAssetWriterInput) {
+        var spins = 0
+        while !input.isReadyForMoreMediaData && spins < 3000 {
+            Thread.sleep(forTimeInterval: 0.002)
+            spins += 1
         }
     }
 }
