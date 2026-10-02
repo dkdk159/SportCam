@@ -357,9 +357,12 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var dimmed = false
     @Published var showLog = false
     @Published var logText = ""
-    @Published var encodedFrames = 0
-    @Published var receivedFrames = 0
-    @Published var videoOrientation: AVCaptureVideoOrientation = .landscapeRight
+    // 注意：这两个计数器是每帧自增的，绝不能是 @Published，
+    // 否则开启预录后每秒会触发 30 次 SwiftUI 重绘，界面会明显卡顿。
+    var encodedFrames = 0
+    var receivedFrames = 0
+    // 竖屏（对齐苹果自带相机）
+    let videoOrientation: AVCaptureVideoOrientation = .portrait
 
     // 参数
     @Published var fieldOfView: FieldOfView = .wide { didSet { if oldValue != fieldOfView { switchLens() } } }
@@ -428,7 +431,6 @@ final class CameraEngine: NSObject, ObservableObject {
         configureAudioSession()
         level.start()
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
-        observeOrientation()
 
         uiTimer?.invalidate()
         uiTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -468,28 +470,6 @@ final class CameraEngine: NSObject, ObservableObject {
         } catch {
             Log.write("[音频] 会话失败 \(error.localizedDescription)")
         }
-    }
-
-    private func observeOrientation() {
-        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
-        NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification,
-                                               object: nil, queue: .main) { [weak self] _ in
-            self?.updateOrientationFromDevice()
-        }
-        updateOrientationFromDevice()
-    }
-
-    private func updateOrientationFromDevice() {
-        let device = UIDevice.current.orientation
-        let target: AVCaptureVideoOrientation?
-        switch device {
-        case .landscapeLeft: target = .landscapeRight
-        case .landscapeRight: target = .landscapeLeft
-        default: target = nil
-        }
-        guard let orientation = target, orientation != videoOrientation else { return }
-        videoOrientation = orientation
-        sessionQueue.async { [weak self] in self?.attachConnectionsLocked() }
     }
 
     // MARK: 会话

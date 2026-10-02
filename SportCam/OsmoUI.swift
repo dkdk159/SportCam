@@ -3,21 +3,21 @@ import AVFoundation
 import UIKit
 
 // ============================================================
-//  界面：横屏专业风格（仿大疆 Osmo Action 机身）
+//  界面：竖屏，布局对齐苹果自带相机；功能保持大疆那套
 // ============================================================
 
 private enum Palette {
     static let accent = Color(red: 0.20, green: 0.86, blue: 0.70)
-    static let record = Color(red: 1.00, green: 0.22, blue: 0.22)
-    static let warn = Color(red: 1.00, green: 0.76, blue: 0.28)
-    static let panel = Color.black.opacity(0.45)
-    static let border = Color.white.opacity(0.16)
-    static func mono(_ size: CGFloat, _ weight: Font.Weight = .semibold) -> Font {
+    static let record = Color(red: 1.00, green: 0.23, blue: 0.23)
+    static let appleYellow = Color(red: 1.00, green: 0.84, blue: 0.04)
+    static let glass = Color.black.opacity(0.42)
+    static let border = Color.white.opacity(0.18)
+    static func mono(_ size: CGFloat, _ weight: Font.Weight = .medium) -> Font {
         .system(size: size, weight: weight, design: .monospaced)
     }
 }
 
-// MARK: - 预览
+// MARK: - 预览（铺满全屏，和苹果相机一样）
 private final class PreviewHost: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
     var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
@@ -30,7 +30,7 @@ private struct CameraPreview: UIViewRepresentable {
     func makeUIView(context: Context) -> PreviewHost {
         let view = PreviewHost()
         view.previewLayer.session = session
-        view.previewLayer.videoGravity = .resizeAspect
+        view.previewLayer.videoGravity = .resizeAspectFill
         apply(view)
         return view
     }
@@ -47,8 +47,8 @@ private struct CameraPreview: UIViewRepresentable {
     }
 }
 
-// MARK: - 基础控件
-private struct GlassLabel: View {
+// MARK: - 小控件
+private struct Pill: View {
     let text: String
     var color: Color = .white
     var size: CGFloat = 12
@@ -58,18 +58,18 @@ private struct GlassLabel: View {
             .font(Palette.mono(size))
             .foregroundColor(color)
             .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(Palette.panel)
+            .padding(.vertical, 5)
+            .background(Palette.glass)
             .clipShape(Capsule())
             .overlay(Capsule().stroke(Palette.border, lineWidth: 0.5))
     }
 }
 
-private struct RoundButton: View {
+private struct CircleIcon: View {
     let icon: String
     var active = false
     var tint: Color = Palette.accent
-    var diameter: CGFloat = 40
+    var diameter: CGFloat = 42
     let action: () -> Void
 
     var body: some View {
@@ -78,45 +78,11 @@ private struct RoundButton: View {
                 .font(.system(size: diameter * 0.42, weight: .semibold))
                 .foregroundColor(active ? tint : .white)
                 .frame(width: diameter, height: diameter)
-                .background(Palette.panel)
+                .background(Palette.glass)
                 .clipShape(Circle())
                 .overlay(Circle().stroke(active ? tint.opacity(0.75) : Palette.border, lineWidth: 1))
         }
         .buttonStyle(PlainButtonStyle())
-    }
-}
-
-/// 右上角参数胶囊：点开就是选项列表（大疆那种参数浮层）
-private struct ParamMenu<Item: Hashable & Identifiable>: View {
-    let title: String
-    let items: [Item]
-    let label: (Item) -> String
-    @Binding var selection: Item
-
-    var body: some View {
-        Menu {
-            ForEach(items) { item in
-                Button {
-                    selection = item
-                } label: {
-                    if item == selection {
-                        Label(label(item), systemImage: "checkmark")
-                    } else {
-                        Text(label(item))
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 5) {
-                Text(title).font(.system(size: 10, weight: .medium)).foregroundColor(.white.opacity(0.55))
-                Text(label(selection)).font(Palette.mono(12)).foregroundColor(Palette.accent)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(Palette.panel)
-            .clipShape(Capsule())
-            .overlay(Capsule().stroke(Palette.border, lineWidth: 0.5))
-        }
     }
 }
 
@@ -144,18 +110,18 @@ private struct LevelOverlay: View {
     var body: some View {
         ZStack {
             Circle()
-                .stroke(sensor.level ? Palette.accent : Palette.warn, lineWidth: 1.5)
-                .frame(width: 56, height: 56)
+                .stroke(sensor.level ? Palette.accent : Palette.appleYellow, lineWidth: 1.5)
+                .frame(width: 54, height: 54)
             Rectangle()
-                .fill(sensor.level ? Palette.accent : Palette.warn)
-                .frame(width: 36, height: 1)
+                .fill(sensor.level ? Palette.accent : Palette.appleYellow)
+                .frame(width: 34, height: 1)
                 .offset(x: CGFloat(sensor.roll * 100))
             Rectangle()
-                .fill(sensor.level ? Palette.accent : Palette.warn)
-                .frame(width: 1, height: 36)
+                .fill(sensor.level ? Palette.accent : Palette.appleYellow)
+                .frame(width: 1, height: 34)
                 .offset(y: CGFloat(sensor.pitch * 100))
             Circle()
-                .fill(sensor.level ? Palette.accent : Palette.warn)
+                .fill(sensor.level ? Palette.accent : Palette.appleYellow)
                 .frame(width: 5, height: 5)
         }
         .opacity(0.85)
@@ -163,7 +129,7 @@ private struct LevelOverlay: View {
 }
 
 // MARK: - 主界面
-struct OsmoScreen: View {
+struct CameraScreen: View {
     @ObservedObject var engine: CameraEngine
     @State private var showSettings = false
     @State private var pinching = false
@@ -186,21 +152,14 @@ struct OsmoScreen: View {
 
             if engine.showGrid { GridOverlay().ignoresSafeArea() }
 
-            // 左右两侧面板
-            HStack(alignment: .center, spacing: 0) {
-                modePanel
-                Spacer()
-                parameterPanel
-            }
-            .padding(.horizontal, 14)
-
             VStack(spacing: 0) {
-                statusBar
+                topBar
                 Spacer()
                 if engine.showLevel {
-                    LevelOverlay(sensor: engine.level).padding(.bottom, 6)
+                    LevelOverlay(sensor: engine.level)
+                    Spacer().frame(height: 18)
                 }
-                controlBar
+                bottomBar
             }
 
             if let toast = engine.toast {
@@ -213,7 +172,7 @@ struct OsmoScreen: View {
                         .padding(.vertical, 10)
                         .background(Color.black.opacity(0.75))
                         .clipShape(Capsule())
-                        .padding(.bottom, 110)
+                        .padding(.bottom, 200)
                     Spacer()
                 }
                 .transition(.opacity)
@@ -230,7 +189,7 @@ struct OsmoScreen: View {
                         .background(Color.black.opacity(0.62))
                         .cornerRadius(8)
                         .padding(.horizontal, 10)
-                        .padding(.bottom, 8)
+                        .padding(.bottom, 250)
                 }
                 .allowsHitTesting(false)
             }
@@ -240,7 +199,7 @@ struct OsmoScreen: View {
                     .contentShape(Rectangle())
                     .gesture(
                         DragGesture(minimumDistance: 20).onEnded { value in
-                            // 上滑唤醒（横屏下依然按屏幕坐标判断向上）
+                            // 上滑唤醒
                             if value.translation.height < -50,
                                abs(value.translation.height) > abs(value.translation.width) {
                                 engine.wakeUp()
@@ -269,160 +228,180 @@ struct OsmoScreen: View {
         .sheet(isPresented: $showSettings) { SettingsSheet(engine: engine) }
     }
 
-    // MARK: 顶部状态
-    private var statusBar: some View {
-        HStack(spacing: 10) {
+    // MARK: 顶部（苹果相机：左上闪光灯 / 右上更多）
+    private var topBar: some View {
+        VStack(spacing: 10) {
+            HStack {
+                CircleIcon(icon: engine.torchOn ? "bolt.fill" : "bolt.slash.fill",
+                           active: engine.torchOn,
+                           tint: Palette.appleYellow) {
+                    engine.toggleTorch()
+                }
+                Spacer()
+                if engine.voiceListening {
+                    Pill(text: "🎙 语音", color: Palette.accent)
+                }
+                Pill(text: "\(Int(engine.battery * 100))%")
+                CircleIcon(icon: "ellipsis.circle") { showSettings = true }
+            }
+
+            // 录制计时 / 预录中
             if engine.isRecording {
                 HStack(spacing: 7) {
                     Circle().fill(Palette.record).frame(width: 9, height: 9)
                     Text(timeText(engine.recordSeconds))
-                        .font(Palette.mono(18, .bold))
+                        .font(Palette.mono(17, .bold))
                         .foregroundColor(.white)
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 5)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
                 .background(Color.black.opacity(0.55))
                 .clipShape(Capsule())
-            } else {
-                GlassLabel(text: "待机", color: .white.opacity(0.75))
-            }
-
-            if engine.preRecordOn {
+            } else if engine.preRecordOn {
                 HStack(spacing: 6) {
                     Circle().fill(Palette.accent).frame(width: 7, height: 7)
-                    Text("预录中").font(Palette.mono(11)).foregroundColor(Palette.accent)
+                    Text("预录中 · \(engine.preRecordDelay.label)")
+                        .font(Palette.mono(11))
+                        .foregroundColor(Palette.accent)
                 }
-                .padding(.horizontal, 10)
+                .padding(.horizontal, 12)
                 .padding(.vertical, 6)
-                .background(Palette.panel)
+                .background(Palette.glass)
                 .clipShape(Capsule())
                 .overlay(Capsule().stroke(Palette.accent.opacity(0.6), lineWidth: 0.5))
             }
-
-            Spacer()
-
-            if engine.voiceListening {
-                GlassLabel(text: "🎙 语音", color: Palette.accent)
-            }
-            if engine.torchOn {
-                GlassLabel(text: "🔦", color: Palette.warn)
-            }
-            GlassLabel(text: "\(Int(engine.battery * 100))%")
-            RoundButton(icon: "slider.horizontal.3", diameter: 34) { showSettings = true }
         }
         .padding(.horizontal, 16)
-        .padding(.top, 12)
+        .padding(.top, 10)
     }
 
-    // MARK: 左侧拍摄模式
-    private var modePanel: some View {
-        VStack(spacing: 10) {
-            modeButton(title: "视频", icon: "video.fill", selected: !engine.preRecordOn) {
-                if engine.preRecordOn { engine.preRecordOn = false }
-            }
-            modeButton(title: "预录", icon: "backward.end.fill", selected: engine.preRecordOn) {
-                if !engine.preRecordOn { engine.preRecordOn = true }
-            }
-            Spacer()
-        }
-        .frame(width: 62)
-    }
-
-    private func modeButton(title: String, icon: String, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 5) {
-                Image(systemName: icon).font(.system(size: 18, weight: .semibold))
-                Text(title).font(.system(size: 11, weight: .medium))
-            }
-            .foregroundColor(selected ? Palette.accent : .white)
-            .frame(width: 58, height: 58)
-            .background(selected ? Palette.accent.opacity(0.18) : Palette.panel)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(selected ? Palette.accent.opacity(0.8) : Palette.border, lineWidth: 1)
-            )
-        }
-        .buttonStyle(PlainButtonStyle())
-        .disabled(engine.isRecording)
-        .opacity(engine.isRecording ? 0.45 : 1)
-    }
-
-    // MARK: 右侧参数
-    private var parameterPanel: some View {
-        VStack(alignment: .trailing, spacing: 8) {
-            ParamMenu(title: "分辨率", items: VideoQuality.allCases, label: { $0.rawValue }, selection: $engine.quality)
-            ParamMenu(title: "帧率", items: FrameRate.allCases, label: { $0.label }, selection: $engine.frameRate)
-            ParamMenu(title: "防抖", items: AntiShake.allCases, label: { $0.rawValue }, selection: $engine.antiShake)
-            ParamMenu(title: "视角", items: FieldOfView.allCases, label: { $0.rawValue }, selection: $engine.fieldOfView)
-            if engine.preRecordOn {
-                ParamMenu(title: "预录", items: PreRecordDelay.allCases, label: { $0.label }, selection: $engine.preRecordDelay)
-            }
-            Spacer()
-        }
-        .frame(width: 128)
-    }
-
-    // MARK: 底部控制
-    private var controlBar: some View {
-        HStack(alignment: .center) {
+    // MARK: 底部（苹果相机：变焦 / 模式 / 参数 / 快门）
+    private var bottomBar: some View {
+        VStack(spacing: 14) {
             // 变焦
-            HStack(spacing: 6) {
+            HStack(spacing: 14) {
                 ForEach(["0.5x", "1x", "2x"], id: \.self) { chip in
                     Button {
                         engine.selectZoomChip(chip)
                     } label: {
                         Text(chip)
-                            .font(Palette.mono(12))
-                            .foregroundColor(zoomChipSelected(chip) ? .black : .white)
-                            .frame(width: 42, height: 30)
-                            .background(zoomChipSelected(chip) ? Color.white : Palette.panel)
-                            .clipShape(Capsule())
-                            .overlay(Capsule().stroke(Palette.border, lineWidth: 0.5))
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(zoomSelected(chip) ? .black : .white)
+                            .frame(width: 40, height: 40)
+                            .background(zoomSelected(chip) ? Color.white : Color.black.opacity(0.35))
+                            .clipShape(Circle())
+                            .overlay(Circle().stroke(Palette.border, lineWidth: 0.5))
                     }
                     .buttonStyle(PlainButtonStyle())
                     .disabled(engine.isRecording)
                 }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            // 快门
-            Button {
-                if engine.isRecording { engine.stopRecording() } else { engine.startRecording() }
-            } label: {
-                ZStack {
-                    Circle().stroke(Color.white, lineWidth: 4).frame(width: 84, height: 84)
-                    if engine.isRecording {
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(Palette.record)
-                            .frame(width: 36, height: 36)
-                    } else {
-                        Circle().fill(Palette.record).frame(width: 68, height: 68)
-                    }
+                if engine.zoom > 1.05 {
+                    Text(String(format: "%.1fx", engine.zoom))
+                        .font(Palette.mono(12))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(Palette.glass)
+                        .clipShape(Capsule())
                 }
             }
-            .buttonStyle(PlainButtonStyle())
 
-            HStack(spacing: 8) {
-                RoundButton(icon: "photo.on.rectangle", diameter: 40) { engine.openPhotos() }
-                RoundButton(icon: "arrow.left.arrow.right.circle", diameter: 40) {
+            // 模式（苹果相机的黄色选中态）
+            HStack(spacing: 22) {
+                modeItem(title: "视频", selected: !engine.preRecordOn) {
+                    if engine.preRecordOn { engine.preRecordOn = false }
+                }
+                modeItem(title: "预录", selected: engine.preRecordOn) {
+                    if !engine.preRecordOn { engine.preRecordOn = true }
+                }
+            }
+
+            // 参数行（点击进设置，像苹果相机顶部那个参数条）
+            Button {
+                showSettings = true
+            } label: {
+                HStack(spacing: 8) {
+                    Text("\(engine.quality.rawValue) · \(engine.frameRate.rawValue)fps")
+                    Text("·")
+                    Text(engine.fieldOfView.rawValue)
+                    Text("·")
+                    Text("防抖\(engine.antiShake.rawValue)")
+                }
+                .font(Palette.mono(11))
+                .foregroundColor(Palette.appleYellow.opacity(0.9))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Palette.glass)
+                .clipShape(Capsule())
+            }
+            .buttonStyle(PlainButtonStyle())
+            .disabled(engine.isRecording)
+            .opacity(engine.isRecording ? 0.4 : 1)
+
+            // 快门行
+            HStack {
+                Button {
+                    engine.openPhotos()
+                } label: {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Palette.glass)
+                        .frame(width: 46, height: 46)
+                        .overlay(
+                            Image(systemName: "photo.on.rectangle")
+                                .font(.system(size: 18))
+                                .foregroundColor(.white)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(Palette.border, lineWidth: 0.5)
+                        )
+                }
+                .buttonStyle(PlainButtonStyle())
+
+                Spacer()
+
+                Button {
+                    if engine.isRecording { engine.stopRecording() } else { engine.startRecording() }
+                } label: {
+                    ZStack {
+                        Circle().stroke(Color.white, lineWidth: 4).frame(width: 78, height: 78)
+                        if engine.isRecording {
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(Palette.record)
+                                .frame(width: 34, height: 34)
+                        } else {
+                            Circle().fill(Palette.record).frame(width: 63, height: 63)
+                        }
+                    }
+                }
+                .buttonStyle(PlainButtonStyle())
+
+                Spacer()
+
+                CircleIcon(icon: "arrow.triangle.2.circlepath.camera", diameter: 46) {
                     let order: [FieldOfView] = [.ultraWide, .wide, .telephoto]
                     if let index = order.firstIndex(of: engine.fieldOfView) {
                         engine.fieldOfView = order[(index + 1) % order.count]
                     }
                 }
-                RoundButton(icon: engine.torchOn ? "bolt.fill" : "bolt.slash.fill",
-                            active: engine.torchOn, tint: Palette.warn, diameter: 40) {
-                    engine.toggleTorch()
-                }
             }
-            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(.horizontal, 34)
         }
-        .padding(.horizontal, 26)
-        .padding(.bottom, 14)
+        .padding(.bottom, 18)
     }
 
-    private func zoomChipSelected(_ chip: String) -> Bool {
+    private func modeItem(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 14, weight: selected ? .bold : .medium))
+                .foregroundColor(selected ? Palette.appleYellow : Color.white.opacity(0.6))
+        }
+        .buttonStyle(PlainButtonStyle())
+        .disabled(engine.isRecording)
+        .opacity(engine.isRecording ? 0.4 : 1)
+    }
+
+    private func zoomSelected(_ chip: String) -> Bool {
         switch chip {
         case "0.5x": return engine.fieldOfView == .ultraWide
         case "2x": return engine.fieldOfView == .wide && engine.zoom >= 1.8
@@ -446,6 +425,21 @@ struct SettingsSheet: View {
     var body: some View {
         NavigationView {
             Form {
+                Section(header: Text("画面")) {
+                    Picker("分辨率", selection: $engine.quality) {
+                        ForEach(VideoQuality.allCases) { Text($0.rawValue).tag($0) }
+                    }.disabled(engine.isRecording)
+                    Picker("帧率", selection: $engine.frameRate) {
+                        ForEach(FrameRate.allCases) { Text($0.label).tag($0) }
+                    }.disabled(engine.isRecording)
+                    Picker("视角", selection: $engine.fieldOfView) {
+                        ForEach(FieldOfView.allCases) { Text($0.rawValue).tag($0) }
+                    }.disabled(engine.isRecording)
+                    Picker("防抖", selection: $engine.antiShake) {
+                        ForEach(AntiShake.allCases) { Text($0.rawValue).tag($0) }
+                    }.disabled(engine.isRecording)
+                }
+
                 Section(header: Text("预录"),
                         footer: Text("开启后持续缓存最近画面，按下录像时会把「按下之前」的画面一起保存。")) {
                     Toggle("开启预录", isOn: $engine.preRecordOn)
@@ -478,7 +472,7 @@ struct SettingsSheet: View {
                         let stop = stopInput.isEmpty ? words.stop
                             : stopInput.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
                         words = (start, stop)
-                        applyWords()
+                        engine.setVoiceWords(start: start, stop: stop)
                     }
                 }
 
@@ -507,11 +501,8 @@ struct SettingsSheet: View {
             startInput = words.start.joined(separator: ",")
             stopInput = words.stop.joined(separator: ",")
         }
-        .onDisappear { applyWords() }
-    }
-
-    private func applyWords() {
-        // 语音口令直接写回引擎（引擎持有 VoiceControl）
-        engine.setVoiceWords(start: words.start, stop: words.stop)
+        .onDisappear {
+            engine.setVoiceWords(start: words.start, stop: words.stop)
+        }
     }
 }

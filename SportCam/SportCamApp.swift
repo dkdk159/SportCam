@@ -6,7 +6,7 @@ struct SportCamApp: App {
 
     var body: some Scene {
         WindowGroup {
-            OsmoScreen(engine: engine)
+            CameraScreen(engine: engine)
                 .preferredColorScheme(.dark)
         }
     }
