@@ -142,13 +142,12 @@ private struct WatermarkPreview: View {
                 Text(line)
             }
         }
+        // 和烧进视频的一致：不铺黑底，白字 + 阴影，画面干净
         .font(.system(size: 12, weight: .semibold))
         .foregroundColor(.white)
-        .shadow(color: .black.opacity(0.8), radius: 2, x: 0, y: 1)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 5)
-        .background(Color.black.opacity(0.26))
-        .cornerRadius(6)
+        .shadow(color: .black.opacity(0.9), radius: 2.5, x: 0, y: 0.5)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
         .padding(.leading, 12)
         .padding(.bottom, bottomInset)
@@ -841,12 +840,13 @@ struct CameraScreen: View {
 
     private var zoomPill: some View {
         HStack(spacing: 4) {
-            // 三档固定摆出来；本机没有超广角时点 0.5x 会提示
+            // 三档固定摆出来；本机没有超广角时 0.5x 置灰不可点
             ForEach(engine.zoomChips, id: \.self) { chip in
                 ZoomChip(label: chip, selected: engine.isZoomChipSelected(chip)) {
                     engine.selectZoomChip(chip)
                 }
-                .disabled(engine.isRecording)
+                .disabled(engine.isRecording || !engine.isZoomChipAvailable(chip))
+                .opacity(engine.isZoomChipAvailable(chip) ? 1 : 0.35)
             }
         }
         .padding(4)
@@ -1091,6 +1091,11 @@ struct SettingsSheet: View {
     var body: some View {
         NavigationView {
             Form {
+                Section(header: Text("显示"),
+                        footer: Text("左上角那个「剩余空间 / 可录时长」的胶囊。不想看就关掉，界面更干净。")) {
+                    Toggle("显示剩余空间", isOn: $engine.showStorage)
+                }
+
                 Section(header: Text("画面")) {
                     Picker("分辨率", selection: $engine.quality) {
                         ForEach(VideoQuality.allCases) { Text($0.rawValue).tag($0) }
@@ -1104,7 +1109,6 @@ struct SettingsSheet: View {
                     Picker("防抖", selection: $engine.antiShake) {
                         ForEach(AntiShake.allCases) { Text($0.rawValue).tag($0) }
                     }.disabled(engine.isRecording)
-                    Toggle("显示剩余空间", isOn: $engine.showStorage)
                 }
 
                 Section(header: Text("降噪"),

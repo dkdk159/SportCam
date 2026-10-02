@@ -135,12 +135,16 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         manager.distanceFilter = 25           // 走 25 米以上就重新上报，地名跟得上移动
     }
 
+    /// 是否已经拿到定位权限（用来决定能不能在启动时静默预热一次）
+    var isAuthorized: Bool {
+        let status = manager.authorizationStatus
+        return status == .authorizedWhenInUse || status == .authorizedAlways
+    }
+
     func start() {
         guard !running else { return }
         running = true
-        // 百米精度就够反查街道了，要求太高系统会一直等更准的点，反而慢
-        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
-        manager.distanceFilter = 25
+        manager.distanceFilter = 25           // 走 25 米以上就重新上报，地名跟得上移动
         switch manager.authorizationStatus {
         case .notDetermined:
             manager.requestWhenInUseAuthorization()
@@ -154,7 +158,7 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
     /// 立刻出一版数据，别让用户干等：
     /// 1) 先把上次记住的地名/坐标顶上去（通常还在同一个地方）；
     /// 2) 有系统缓存位置就直接用它反查；
-    /// 3) 同时开连续定位 + 单次定位，拿到更新的点再纠正。
+    /// 3) 先用粗精度逼系统马上给一个点，再把精度收紧。
     private func begin() {
         if let cached = cachedPlace() {
             DispatchQueue.main.async { self.onPlace?(cached) }
@@ -162,6 +166,9 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         if let cached = cachedCoordinate() {
             DispatchQueue.main.async { self.onFix?(cached.0, cached.1, cached.2) }
         }
+        // 粗精度优先：百米精度要等 GPS 收敛，冷启动能拖好几秒；
+        // 三公里精度通常走基站/WiFi，1 秒内就有第一个点，先出地名再慢慢变准。
+        manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
         manager.startUpdatingLocation()
         if let known = manager.location {
             if abs(known.timestamp.timeIntervalSinceNow) < 1800 { resolve(known) }
@@ -231,6 +238,10 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let location = locations.last else { return }
+        // 已经拿到点，把精度收紧到百米 —— 够反查街道门牌了
+        if manager.desiredAccuracy != kCLLocationAccuracyHundredMeters {
+            manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        }
         DispatchQueue.main.async {
             self.onFix?(location.coordinate, location.altitude, location.verticalAccuracy >= 0)
         }
@@ -415,7 +426,7 @@ final class WatermarkRenderer {
     private func render(lines: [String]) -> UIImage? {
         guard size.width > 8, size.height > 8 else { return nil }
 
-        let fontSize = max(size.height * 0.026, 16)
+        let fontSize = max(size.height * 0.029, 18)
         let margin = size.width * 0.035
 
         let format = UIGraphicsImageRendererFormat()
@@ -426,42 +437,33 @@ final class WatermarkRenderer {
         return canvas.image { _ in
             let paragraph = NSMutableParagraphStyle()
             paragraph.alignment = .left
-            paragraph.lineSpacing = fontSize * 0.26
+            paragraph.lineSpacing = fontSize * 0.3
 
+            // 参考 App 的写法：不铺黑底，只用「白字 + 细黑描边 + 淡阴影」，
+            // 亮天空下照样看得清，画面也干净。
             let shadow = NSShadow()
-            shadow.shadowColor = UIColor.black.withAlphaComponent(0.85)
-            shadow.shadowBlurRadius = fontSize * 0.22
+            shadow.shadowColor = UIColor.black.withAlphaComponent(0.75)
+            shadow.shadowBlurRadius = fontSize * 0.3
             shadow.shadowOffset = CGSize(width: 0, height: fontSize * 0.05)
 
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: UIFont.systemFont(ofSize: fontSize, weight: .semibold),
                 .foregroundColor: UIColor.white,
+                .strokeColor: UIColor.black.withAlphaComponent(0.5),
+                .strokeWidth: -3.0,
                 .paragraphStyle: paragraph,
                 .shadow: shadow
             ]
 
             let text = lines.joined(separator: "\n") as NSString
-            let maxTextWidth = size.width - margin * 3
+            let maxTextWidth = size.width - margin * 2
             let textBounds = text.boundingRect(with: CGSize(width: maxTextWidth, height: .greatestFiniteMagnitude),
                                                options: [.usesLineFragmentOrigin, .usesFontLeading],
                                                attributes: attrs,
                                                context: nil)
 
-            // 半透明底衬：亮天空下也看得清
-            let padX = fontSize * 0.55
-            let padY = fontSize * 0.34
-            let boxWidth = min(ceil(textBounds.width) + padX * 2, size.width - margin * 1.6)
-            let boxHeight = ceil(textBounds.height) + padY * 2
-            let boxRect = CGRect(x: margin * 0.8,
-                                 y: size.height - margin - boxHeight,
-                                 width: boxWidth,
-                                 height: boxHeight)
-
-            UIColor.black.withAlphaComponent(0.26).setFill()
-            UIBezierPath(roundedRect: boxRect, cornerRadius: boxHeight * 0.2).fill()
-
-            text.draw(with: CGRect(x: boxRect.minX + padX,
-                                   y: boxRect.minY + padY,
+            text.draw(with: CGRect(x: margin,
+                                   y: size.height - margin - ceil(textBounds.height),
                                    width: maxTextWidth,
                                    height: ceil(textBounds.height)),
                       options: [.usesLineFragmentOrigin, .usesFontLeading],

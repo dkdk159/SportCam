@@ -505,7 +505,9 @@ final class CameraEngine: NSObject, ObservableObject {
     func launch() {
         configureAudioSession()
         level.start()
+        refreshLensAvailability()   // 本机有没有超广角（决定 0.5x 能不能用）
         loadWatermarkSettings()     // 上次勾的水印项和自定义描述
+        prewarmLocation()           // 已授权就先把位置取一次，点水印时不用干等
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
 
         recorder.onSegmentsChanged = { [weak self] total in
@@ -968,11 +970,8 @@ final class CameraEngine: NSObject, ObservableObject {
         default:     fov = .wide;      factor = 1.0
         }
 
-        // 0.5x 要超广角：本机没有（比如 iPhone 8 Plus 只有广角+长焦）、或者在前置，都做不了，直说
-        if fov == .ultraWide, cameraPosition != .back || lensDevice(.ultraWide) == nil {
-            message("本机没有超广角镜头，用不了 0.5x")
-            return
-        }
+        // 0.5x 要后置超广角。按钮已经是置灰的，这里只是兜底
+        guard isZoomChipAvailable(chip) else { return }
 
         guard cameraPosition == .back else {
             zoom = factor                  // 前置没有多摄，直接在广角上做数字变焦
@@ -988,12 +987,36 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     /// 焦段档位：0.5x / 1x / 2x 三档固定摆出来。
-    /// 本机没有超广角时点 0.5x 会明确提示，而不是默默没反应。
+    /// 本机没有超广角时 0.5x 会置灰不可点（见 isZoomChipAvailable）。
     let zoomChips = ["0.5x", "1x", "2x"]
+    /// 后置有没有超广角镜头（0.5x 靠它）。开机算一次就够，查设备不该每帧都跑。
+    @Published var ultraWideAvailable = false
+
+    func refreshLensAvailability() {
+        ultraWideAvailable = lensDevice(.ultraWide) != nil
+    }
+
+    /// 这一档在当前机型/当前镜头上能不能用。0.5x 需要后置超广角，前置也做不了。
+    func isZoomChipAvailable(_ chip: String) -> Bool {
+        guard chip == "0.5x" else { return true }
+        return cameraPosition == .back && ultraWideAvailable
+    }
 
     /// 本机后置真实存在的镜头。设置里的「视角」只列有的，免得选了没反应。
     var availableFieldOfViews: [FieldOfView] {
         FieldOfView.allCases.filter { lensDevice($0) != nil }
+    }
+
+    /// 已经授权过定位的话，启动时先悄悄取一次位置。
+    /// 这样用户点开水印面板时地名已经在手里，不会出现"要点两次才出来"。
+    /// 30 秒内没开水印就停掉，不留后台定位。
+    private func prewarmLocation() {
+        guard locator.isAuthorized else { return }
+        locator.start()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let self = self, !self.watermarkOn else { return }
+            self.locator.stop()
+        }
     }
 
     /// 某档是否处于选中态（前置没有超广角/长焦，统一按广角算）
@@ -1399,10 +1422,10 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    /// 启动定位 / 天气（幂等）。水印面板打开、或勾选任意一项时也会调，
-    /// 保证"点一下就马上有数据"，不用开关两次。
+    /// 启动定位 / 天气（幂等）。
+    /// 点开「水印时间」面板、或勾选任意一项时都会调 —— 目的是提前把定位跑起来，
+    /// 等用户勾上的那一刻数据已经在手里，不用再开关两次。
     func ensureWatermarkStarted() {
-        guard watermarkOn else { return }
         locator.start()
     }
 
