@@ -63,15 +63,15 @@ enum FrameRate: Int, CaseIterable, Identifiable {
 enum AntiShake: String, CaseIterable, Identifiable {
     case off = "关闭"
     case standard = "标准"
-    case high = "高"
     case cinematic = "影院级"
+    case auto = "自动"
     var id: String { rawValue }
     var mode: AVCaptureVideoStabilizationMode {
         switch self {
         case .off: return .off
         case .standard: return .standard
-        case .high: return .high
         case .cinematic: return .cinematic
+        case .auto: return .auto
         }
     }
 }
