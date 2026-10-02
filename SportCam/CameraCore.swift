@@ -408,8 +408,16 @@ final class CameraEngine: NSObject, ObservableObject {
 
     @Published var preRecordOn = false { didSet { if oldValue != preRecordOn { syncPreRecord() } } }
     @Published var preRecordDelay: PreRecordDelay = .s15 { didSet { if oldValue != preRecordDelay { syncPreRecord() } } }
-    @Published var powerSave: PowerSaveDelay = .never { didSet { resetPowerTimer() } }
+    @Published var powerSave: PowerSaveDelay = .never {
+        didSet {
+            // 记住上次选过的时间，屏幕上的省电快捷键关掉再打开还是这个值
+            if powerSave != .never { lastPowerSave = powerSave }
+            resetPowerTimer()
+        }
+    }
     @Published var showGrid = true
+    /// 左上角「剩余空间 / 可录时长」显示开关
+    @Published var showStorage = true
     /// 画面中间那个"圆圈十字架"水平仪，默认不显示（设置 → 拍摄辅助 里可以打开）
     @Published var showLevel = false
     /// 降噪：音频风噪抑制 + 画面暗光降噪，哪个系统支持就开哪个
@@ -479,6 +487,8 @@ final class CameraEngine: NSObject, ObservableObject {
     private var flagRecording = false
     private var flagVoice = false
     private var flagForceKey = false
+    /// 正在翻转摄像头。连点会并发两次 beginConfiguration，会话直接乱掉 —— 用它挡掉
+    private var flagSwitching = false
 
     private var recording: Bool { stateLock.lock(); defer { stateLock.unlock() }; return flagRecording }
     private var voiceActive: Bool { stateLock.lock(); defer { stateLock.unlock() }; return flagVoice }
@@ -487,11 +497,14 @@ final class CameraEngine: NSObject, ObservableObject {
     private var powerTimer: Timer?
     private var uiTimer: Timer?
     private var storageTick = 0
+    /// 省电快捷键用的「上次选过的熄屏时间」
+    private var lastPowerSave: PowerSaveDelay = .s15
 
     // MARK: 启动
     func launch() {
         configureAudioSession()
         level.start()
+        refreshZoomChips()          // 先按机型的镜头算好焦段档位（没有超广角就不显示 0.5x）
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
 
         recorder.onSegmentsChanged = { [weak self] total in
@@ -655,34 +668,75 @@ final class CameraEngine: NSObject, ObservableObject {
         AVCaptureDevice.default(fov.lens, for: .video, position: .back)
     }
 
-    /// 前后摄像头翻转
+    /// 前后摄像头翻转。
+    /// 以前的毛病：连点会并发跑两次 beginConfiguration，把会话搞乱（表现为卡住/黑屏）；
+    /// 而且 cameraPosition 要等换完才更新，按钮和镜像都慢半拍。
     func toggleCamera() {
+        stateLock.lock()
+        if flagSwitching {
+            stateLock.unlock()
+            return                       // 上一次还没换完，忽略这次点击
+        }
+        flagSwitching = true
+        stateLock.unlock()
+
+        let next: AVCaptureDevice.Position = cameraPosition == .back ? .front : .back
+        // 先让界面切过去：镜像、按钮高亮立刻响应，失败再退回来
+        cameraPosition = next
+
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
-            if self.recording {
+            defer {
+                self.stateLock.lock()
+                self.flagSwitching = false
+                self.stateLock.unlock()
+            }
+
+            func giveUp(_ reason: String) {
+                DispatchQueue.main.async {
+                    self.cameraPosition = next == .back ? .front : .back
+                    self.message(reason)
+                }
+            }
+
+            guard !self.recording else {
                 Log.write("[镜头] 录制中不可翻转")
+                giveUp("录制中不能翻转")
                 return
             }
-            let next: AVCaptureDevice.Position = self.cameraPosition == .back ? .front : .back
-            guard let device = self.camera(next, fieldOfView: self.fieldOfView),
+
+            // 前置只有广角：切过去时把视角收回广角，免得切回来时焦段对不上
+            let fov: FieldOfView = next == .front ? .wide : self.fieldOfView
+            guard let device = self.camera(next, fieldOfView: fov),
                   let input = try? AVCaptureDeviceInput(device: device) else {
-                DispatchQueue.main.async { self.message("该机型不支持翻转") }
+                giveUp("该机型不支持翻转")
                 return
             }
+
             let old = self.cameraInput
+            // 换镜头前先关掉闪光灯：否则后置的灯会一直亮着，切到前置也关不掉
+            if let oldDevice = self.cameraDevice, oldDevice.hasTorch,
+               oldDevice.isTorchModeSupported(.off) {
+                try? oldDevice.lockForConfiguration()
+                oldDevice.torchMode = .off
+                oldDevice.unlockForConfiguration()
+            }
             self.session.beginConfiguration()
             if let old = old { self.session.removeInput(old) }
             guard self.session.canAddInput(input) else {
                 if let old = old { self.session.addInput(old) }
                 self.session.commitConfiguration()
+                giveUp("翻转失败，请重试")
                 return
             }
             self.session.addInput(input)
             self.cameraInput = input
             self.cameraDevice = device
+            self.pendingZoom = 1.0
             self.session.commitConfiguration()
             self.attachConnectionsLocked()
             self.applyFrameRateLocked()
+            self.applyDenoiseLocked()          // 新摄像头的暗光降噪也要贴上去
             self.encoder.invalidate()
             self.needEncoderRebuild = true
             // 换了摄像头：分段格式已不一致，旧段全部作废
@@ -690,6 +744,11 @@ final class CameraEngine: NSObject, ObservableObject {
             self.rearmPreRecord()
             DispatchQueue.main.async {
                 self.cameraPosition = next
+                // 先落 cameraPosition 再落 fieldOfView：前者已是 .front 时，
+                // fieldOfView 的 didSet 会走 switchLens，被"前置不支持切换焦段"挡掉，正好不动会话
+                self.fieldOfView = fov
+                self.refreshZoomChips()     // 前置没有超广角，0.5x 档要跟着收起来
+                self.torchOn = false        // 上面已经把灯关了，按钮同步灭掉
                 self.zoom = 1.0
                 self.exposureBias = 0
                 self.isoValue = 0
@@ -698,7 +757,6 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.focusLensPosition = -1
             }
             Log.write("[镜头] 翻转 → \(next == .front ? "前置" : "后置")")
-            self.applyDenoiseLocked()          // 新摄像头的暗光降噪也要贴上去
         }
     }
 
@@ -875,6 +933,29 @@ final class CameraEngine: NSObject, ObservableObject {
             // 真要换镜头：先把目标倍数放好，切完镜头由 switchLens 套用
             pendingZoom = factor
             fieldOfView = fov
+        }
+    }
+
+    /// 本机当前可用的焦段档位。
+    /// 没有超广角就不摆 0.5x —— 系统相机也是这么做的，否则会出现"点得动但画面没反应"的假按钮。
+    /// 只在启动和翻转时算一次：查设备（AVCaptureDevice.default）不适合每帧都跑。
+    @Published var zoomChips: [String] = ["1x", "2x"]
+
+    func refreshZoomChips() {
+        var chips: [String] = []
+        if cameraPosition == .back, lensDevice(.ultraWide) != nil { chips.append("0.5x") }
+        chips.append("1x")
+        chips.append("2x")
+        zoomChips = chips
+    }
+
+    /// 某档是否处于选中态（前置没有超广角/长焦，统一按广角算）
+    func isZoomChipSelected(_ chip: String) -> Bool {
+        let fov: FieldOfView = cameraPosition == .front ? .wide : fieldOfView
+        switch chip {
+        case "0.5x": return fov == .ultraWide
+        case "2x":   return fov == .wide && zoom >= 1.8
+        default:     return fov == .wide && zoom < 1.8
         }
     }
 
@@ -1446,12 +1527,15 @@ final class CameraEngine: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
             let next = !self.torchOn
-            if let device = self.cameraDevice, device.hasTorch,
-               device.isTorchModeSupported(next ? .on : .off) {
-                try? device.lockForConfiguration()
-                device.torchMode = next ? .on : .off
-                device.unlockForConfiguration()
+            guard let device = self.cameraDevice, device.hasTorch,
+                  device.isTorchModeSupported(next ? .on : .off) else {
+                // 这颗镜头没有闪光灯（比如前置）：别把按钮点亮了骗人
+                DispatchQueue.main.async { self.torchOn = false }
+                return
             }
+            try? device.lockForConfiguration()
+            device.torchMode = next ? .on : .off
+            device.unlockForConfiguration()
             DispatchQueue.main.async { self.torchOn = next }
         }
     }
@@ -1519,6 +1603,11 @@ final class CameraEngine: NSObject, ObservableObject {
     func wakeUp() {
         dimmed = false
         resetPowerTimer()
+    }
+
+    /// 屏幕上的省电快捷键：一键开关自动熄屏（时间沿用上次在设置里选的）
+    func togglePowerSave() {
+        if powerSave == .never { powerSave = lastPowerSave } else { powerSave = .never }
     }
 
     func openPhotos() {

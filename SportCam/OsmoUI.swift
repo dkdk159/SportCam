@@ -105,6 +105,33 @@ private struct CircleIcon: View {
     }
 }
 
+/// 右侧的快捷开关（水印 / 省电）：图标 + 文字的小胶囊，打开时变绿，一眼看得出状态
+private struct QuickToggle: View {
+    let icon: String
+    let title: String
+    let active: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .foregroundColor(active ? .black : .white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(active ? Palette.accent : Palette.glass)
+            .clipShape(Capsule())
+            .overlay(Capsule().stroke(active ? Color.clear : Palette.border, lineWidth: 0.5))
+            .animation(.easeOut(duration: 0.18), value: active)
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+}
+
 /// 焦段档位（0.5x / 1x / 2x）。
 /// 选中状态用动画过渡 —— 直接硬切会"啪"地闪一下，看着像是在重新加载画面。
 private struct ZoomChip: View {
@@ -281,6 +308,7 @@ struct CameraScreen: View {
     @ObservedObject var engine: CameraEngine
     @State private var showSettings = false
     @State private var showDuration = false
+    @State private var showFormat = false
     @State private var pinching = false
     @State private var zoomBase: CGFloat = 1.0
     @State private var focusReticle: CGPoint?
@@ -333,6 +361,26 @@ struct CameraScreen: View {
                 if engine.showLevel {
                     LevelOverlay(sensor: engine.level)
                     Spacer().frame(height: 14)
+                }
+                // 右下方快捷开关：水印 / 省电（参数面板打开时先让位）
+                if engine.proControl == nil {
+                    HStack {
+                        Spacer()
+                        VStack(spacing: 12) {
+                            QuickToggle(icon: "textformat",
+                                        title: "水印",
+                                        active: engine.watermarkOn) {
+                                engine.watermarkOn.toggle()
+                            }
+                            QuickToggle(icon: "moon.fill",
+                                        title: "省电",
+                                        active: engine.powerSave != .never) {
+                                engine.togglePowerSave()
+                            }
+                        }
+                        .padding(.trailing, 20)   // 与底栏圆形按钮右边缘对齐
+                    }
+                    .padding(.bottom, 12)
                 }
                 // 参数面板贴在底栏上方：快门按钮始终露在外面
                 if let control = engine.proControl {
@@ -403,6 +451,7 @@ struct CameraScreen: View {
             }
 
             if showDuration && engine.proControl == nil { durationPicker }
+            if showFormat && engine.proControl == nil { formatPicker }
         }
         .onAppear { engine.launch() }
         .statusBar(hidden: true)
@@ -413,24 +462,39 @@ struct CameraScreen: View {
     private var topBar: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 5) {
-                    Image(systemName: "internaldrive").font(.system(size: 10))
-                    Text("\(engine.freeSpaceText) / \(engine.recordableText)")
-                        .font(Palette.mono(11))
-                }
-                .foregroundColor(.white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Palette.glass)
-                .clipShape(Capsule())
-
-                Text("\(engine.quality.rawValue)/\(engine.frameRate.rawValue)")
-                    .font(Palette.mono(11))
+                if engine.showStorage {
+                    HStack(spacing: 5) {
+                        Image(systemName: "internaldrive").font(.system(size: 10))
+                        Text("\(engine.freeSpaceText) / \(engine.recordableText)")
+                            .font(Palette.mono(11))
+                    }
                     .foregroundColor(.white)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
                     .background(Palette.glass)
                     .clipShape(Capsule())
+                }
+
+                // 画质胶囊：分辨率 + 帧率，点一下就能改
+                Button {
+                    showFormat = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Text("\(engine.quality.rawValue)/\(engine.frameRate.rawValue)fps")
+                            .font(Palette.mono(11))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8, weight: .bold))
+                            .opacity(0.75)
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Palette.glass)
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(PlainButtonStyle())
+                .disabled(engine.isRecording)
+                .opacity(engine.isRecording ? 0.5 : 1)
             }
 
             Spacer()
@@ -612,6 +676,80 @@ struct CameraScreen: View {
         .buttonStyle(PlainButtonStyle())
     }
 
+    // MARK: 分辨率 + 帧率（点顶部画质胶囊弹出）
+    private var formatPicker: some View {
+        ZStack {
+            Color.black.opacity(0.45)
+                .ignoresSafeArea()
+                .onTapGesture { showFormat = false }
+
+            VStack(spacing: 14) {
+                Text("分辨率")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.white)
+
+                HStack(spacing: 10) {
+                    ForEach(VideoQuality.allCases) { item in
+                        formatCell(item.rawValue, selected: engine.quality == item) {
+                            engine.quality = item
+                        }
+                    }
+                }
+
+                Text("帧率")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.top, 2)
+
+                HStack(spacing: 10) {
+                    ForEach(FrameRate.allCases) { item in
+                        formatCell("\(item.rawValue)fps", selected: engine.frameRate == item) {
+                            engine.frameRate = item
+                        }
+                    }
+                }
+
+                Text(engine.isRecording ? "录制中不能改分辨率和帧率"
+                                        : "分辨率越高越清晰，帧率越高越流畅，文件也越大")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.55))
+
+                Button {
+                    showFormat = false
+                } label: {
+                    Text("完成")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.black)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 40)
+                        .background(Color.white)
+                        .cornerRadius(10)
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+            .padding(20)
+            .frame(maxWidth: 330)
+            .background(Color(red: 0.16, green: 0.16, blue: 0.17))
+            .cornerRadius(16)
+        }
+    }
+
+    private func formatCell(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 40)
+                .background(selected ? Color(red: 0.13, green: 0.48, blue: 0.95)
+                                     : Color.white.opacity(0.10))
+                .cornerRadius(8)
+        }
+        .buttonStyle(PlainButtonStyle())
+        .disabled(engine.isRecording)
+        .opacity(engine.isRecording ? 0.5 : 1)
+    }
+
     // MARK: 底部（变焦胶囊 / 快门行 + 参数按钮）
     private var bottomBar: some View {
         VStack(spacing: 14) {
@@ -623,8 +761,9 @@ struct CameraScreen: View {
 
     private var zoomPill: some View {
         HStack(spacing: 4) {
-            ForEach(["0.5x", "1x", "2x"], id: \.self) { chip in
-                ZoomChip(label: chip, selected: zoomSelected(chip)) {
+            // 档位由引擎按机型给：没有超广角就没有 0.5x，不摆点不动的假按钮
+            ForEach(engine.zoomChips, id: \.self) { chip in
+                ZoomChip(label: chip, selected: engine.isZoomChipSelected(chip)) {
                     engine.selectZoomChip(chip)
                 }
                 .disabled(engine.isRecording)
@@ -633,6 +772,7 @@ struct CameraScreen: View {
         .padding(4)
         .background(Color.black.opacity(0.45))
         .clipShape(Capsule())
+        .animation(.easeOut(duration: 0.18), value: engine.zoomChips.count)
     }
 
     private var shutterRow: some View {
@@ -798,14 +938,6 @@ struct CameraScreen: View {
         )
     }
 
-    private func zoomSelected(_ chip: String) -> Bool {
-        switch chip {
-        case "0.5x": return engine.fieldOfView == .ultraWide
-        case "2x": return engine.fieldOfView == .wide && engine.zoom >= 1.8
-        default: return engine.fieldOfView == .wide && engine.zoom < 1.8
-        }
-    }
-
     /// 开关参数面板。显式关掉动画 —— 否则面板会在收起的过程中滑过底栏，
     /// 出现"关掉了但下面还压着一层"的残影。
     private func setPro(_ control: ProControl?) {
@@ -919,6 +1051,7 @@ struct SettingsSheet: View {
                 Section(header: Text("拍摄辅助")) {
                     Toggle("构图网格", isOn: $engine.showGrid)
                     Toggle("水平仪", isOn: $engine.showLevel)
+                    Toggle("显示剩余空间", isOn: $engine.showStorage)
                     Toggle("录制提示音", isOn: $engine.beepOn)
                 }
             }
