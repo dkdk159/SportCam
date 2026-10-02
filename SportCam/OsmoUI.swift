@@ -26,11 +26,18 @@ private final class PreviewHost: UIView {
 private struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     let orientation: AVCaptureVideoOrientation
+    /// 音量键 / iPhone 16 相机按钮：按一下切换录制
+    let onCaptureButton: () -> Void
 
     func makeUIView(context: Context) -> PreviewHost {
         let view = PreviewHost()
         view.previewLayer.session = session
         view.previewLayer.videoGravity = .resizeAspectFill
+        if #available(iOS 17.2, *) {
+            view.addInteraction(AVCaptureEventInteraction { event in
+                if event.phase == .ended { onCaptureButton() }
+            })
+        }
         apply(view)
         return view
     }
@@ -139,7 +146,9 @@ struct CameraScreen: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            CameraPreview(session: engine.session, orientation: engine.videoOrientation)
+            CameraPreview(session: engine.session,
+                          orientation: engine.videoOrientation,
+                          onCaptureButton: { engine.toggleRecording() })
                 .ignoresSafeArea()
                 .gesture(
                     MagnificationGesture()

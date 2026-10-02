@@ -374,7 +374,8 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var showLevel = true
     @Published var beepOn = true
     @Published var debugInfo = false
-    @Published var voiceOn = false { didSet { if oldValue != voiceOn { voiceOn ? startVoice() : stopVoice() } } }
+    /// 语音控制默认开启：装好即可直接说「开始录像」「停止录像」
+    @Published var voiceOn = true { didSet { if oldValue != voiceOn { voiceOn ? startVoice() : stopVoice() } } }
     @Published var startWords = ["开始录像", "开启录像", "开始录制", "开始拍摄"]
     @Published var stopWords = ["停止录像", "结束录像", "关闭录像", "停止录制", "保存"]
 
@@ -454,6 +455,50 @@ final class CameraEngine: NSObject, ObservableObject {
         }
 
         sessionQueue.async { [weak self] in self?.buildSession() }
+
+        // 语音默认开启：直接开始监听
+        if voiceOn { startVoice() }
+
+        observeSessionLifecycle()
+    }
+
+    /// 会话被电话/后台等打断后自动恢复，否则画面会停、编码也就停了
+    private func observeSessionLifecycle() {
+        let center = NotificationCenter.default
+        center.addObserver(forName: .AVCaptureSessionWasInterrupted, object: session, queue: .main) { note in
+            let raw = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int ?? -1
+            Log.write("[会话] 被中断 reason=\(raw)")
+        }
+        center.addObserver(forName: .AVCaptureSessionInterruptionEnded, object: session, queue: .main) { [weak self] _ in
+            Log.write("[会话] 中断结束，尝试恢复")
+            self?.restartSession()
+        }
+        center.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { [weak self] note in
+            let error = note.userInfo?[AVCaptureSessionErrorKey] as? Error
+            Log.write("[会话] 运行错误 \(error?.localizedDescription ?? "")")
+            self?.restartSession()
+        }
+        center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt ?? 0
+            if raw == AVAudioSession.InterruptionType.ended.rawValue {
+                Log.write("[音频] 中断结束，恢复会话")
+                self?.restartSession()
+            }
+        }
+    }
+
+    private func restartSession() {
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            if !self.session.isRunning { self.session.startRunning() }
+            self.attachConnectionsLocked()
+            // 会话恢复后采集时间戳会跳变，编码器与分段都要重新开始
+            self.encoder.invalidate()
+            self.needEncoderRebuild = true
+            self.recorder.reset()
+            self.rearmPreRecord()
+            Log.write("[会话] 恢复完成 running=\(self.session.isRunning)")
+        }
     }
 
     private func configureAudioSession() {
@@ -673,6 +718,15 @@ final class CameraEngine: NSObject, ObservableObject {
         }
         recorder.beginClip()
         Log.write("[录制] 开始")
+    }
+
+    /// 音量键 / iPhone 16 相机按钮：按一下切换录制
+    func toggleRecording() {
+        if recording {
+            stopRecording()
+        } else {
+            startRecording()
+        }
     }
 
     func stopRecording() {

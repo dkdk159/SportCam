@@ -248,6 +248,8 @@ final class SegmentRecorder {
     private var pendingFinishes = 0
     private var endCompletion: (([URL]) -> Void)?
     private var sequence = 0
+    private var lastRejectLog = Date.distantPast
+    private var badSegments = 0
 
     /// 分段数量变化通知（主线程回调，供界面显示）
     var onSegmentsChanged: ((Int) -> Void)?
@@ -351,7 +353,12 @@ final class SegmentRecorder {
         if lastVideoPTS.isValid && CMTimeCompare(time, lastVideoPTS) <= 0 { return }
         // 实时写入：未就绪就丢这一帧（阻塞会拖垮采集线程）
         guard input.isReadyForMoreMediaData else { return }
-        if input.append(sample) { lastVideoPTS = time }
+        if input.append(sample) {
+            lastVideoPTS = time
+        } else if Date().timeIntervalSince(lastRejectLog) > 5 {
+            lastRejectLog = Date()
+            Log.write("[分段] 追加视频被拒 status=\(w.status.rawValue) \(w.error?.localizedDescription ?? "")")
+        }
     }
 
     private func shouldRotate(at time: CMTime) -> Bool {
@@ -409,7 +416,10 @@ final class SegmentRecorder {
             audioInput = audio
             currentURL = url
             segmentStart = time
-            lastVideoPTS = time
+            // 注意：这里不能把 lastVideoPTS 设成 time，
+            // 否则下面"时间戳必须递增"的判断会把本段的第一个关键帧直接丢掉 ——
+            // 段首没有关键帧，合并时就会读不出视频格式。
+            lastVideoPTS = .invalid
             lastAudioPTS = .invalid
             return true
         } catch {
@@ -440,8 +450,15 @@ final class SegmentRecorder {
         let useClip = intoClip
         assetWriter.finishWriting { [weak self] in
             guard let self = self else { return }
+            let ok = assetWriter.status == .completed
+            let reason = assetWriter.error?.localizedDescription ?? ""
             self.queue.async {
-                if discard {
+                if !ok {
+                    // 写坏的段绝不能进合并列表，否则整段合并都会失败
+                    self.badSegments += 1
+                    Log.write("[分段] 收尾失败(已丢弃) status=\(assetWriter.status.rawValue) \(reason)")
+                    try? FileManager.default.removeItem(at: segment.url)
+                } else if discard {
                     try? FileManager.default.removeItem(at: segment.url)
                 } else if useClip {
                     self.clip.append(segment)
@@ -498,7 +515,11 @@ final class SegmentRecorder {
 enum SegmentMerger {
     static func merge(_ urls: [URL], to output: URL, completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let ok = concat(urls, to: output)
+            var ok = concat(urls, to: output)
+            if !ok {
+                Log.write("[合并] 逐帧合并未成功，改用拼接方式重试")
+                ok = fallback(urls, to: output)
+            }
             DispatchQueue.main.async { completion(ok) }
         }
     }
@@ -521,22 +542,32 @@ enum SegmentMerger {
             }
         }
 
-        // 从第一段取视频/音频格式（合并时直接沿用，不重新编码）
-        let firstAsset = AVURLAsset(url: valid[0])
-        guard let videoFormat = readSamples(firstAsset, media: .video).first
-            .flatMap({ CMSampleBufferGetFormatDescription($0) }) else {
-            Log.write("[合并] 读不到视频格式")
+        // 从"第一个读得动的段"取视频/音频格式；读不动的直接跳过，不让它拖垮整次合并
+        var videoFormat: CMFormatDescription?
+        var audioFormat: CMFormatDescription?
+        for url in valid {
+            let probe = AVURLAsset(url: url)
+            if let format = readSamples(probe, media: .video, quiet: true).first
+                .flatMap({ CMSampleBufferGetFormatDescription($0) }) {
+                videoFormat = format
+                audioFormat = readSamples(probe, media: .audio, quiet: true).first
+                    .flatMap({ CMSampleBufferGetFormatDescription($0) })
+                break
+            }
+            Log.write("[合并] 跳过读不动的分段 \(url.lastPathComponent)")
+        }
+        guard videoFormat != nil else {
+            Log.write("[合并] 所有分段都读不到视频格式")
             return false
         }
-        let audioFormat = readSamples(firstAsset, media: .audio).first
-            .flatMap({ CMSampleBufferGetFormatDescription($0) })
 
         try? FileManager.default.removeItem(at: output)
         guard let writer = try? AVAssetWriter(outputURL: output, fileType: .mp4) else {
             Log.write("[合并] 创建写入器失败")
             return false
         }
-        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: videoFormat)
+        guard let hint = videoFormat else { return false }
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: hint)
         videoInput.expectsMediaDataInRealTime = false
         guard writer.canAdd(videoInput) else {
             Log.write("[合并] 无法添加视频轨")
@@ -626,16 +657,82 @@ enum SegmentMerger {
         return ok
     }
 
-    private static func readSamples(_ asset: AVURLAsset, media: AVMediaType) -> [CMSampleBuffer] {
-        guard let track = asset.tracks(withMediaType: media).first,
-              let reader = try? AVAssetReader(asset: asset) else { return [] }
+    /// 兜底：用 AVMutableComposition + passthrough 拼接。
+    /// 逐帧合并失败时仍能交出一个文件（接缝可能不如逐帧方案干净）。
+    private static func fallback(_ urls: [URL], to output: URL) -> Bool {
+        let valid = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !valid.isEmpty else { return false }
+
+        let composition = AVMutableComposition()
+        let videoTrack = composition.addMutableTrack(withMediaType: .video,
+                                                     preferredTrackID: kCMPersistentTrackID_Invalid)
+        let audioTrack = composition.addMutableTrack(withMediaType: .audio,
+                                                     preferredTrackID: kCMPersistentTrackID_Invalid)
+        var cursor = CMTime.zero
+        var inserted = 0
+
+        for url in valid {
+            let asset = AVURLAsset(url: url)
+            guard let track = asset.tracks(withMediaType: .video).first else { continue }
+            let range = CMTimeRange(start: track.timeRange.start, duration: track.timeRange.duration)
+            guard range.duration.isValid, CMTimeCompare(range.duration, .zero) > 0 else { continue }
+            do {
+                try videoTrack?.insertTimeRange(range, of: track, at: cursor)
+                inserted += 1
+                if let audio = asset.tracks(withMediaType: .audio).first {
+                    let audioRange = CMTimeRange(start: audio.timeRange.start, duration: audio.timeRange.duration)
+                    try? audioTrack?.insertTimeRange(audioRange, of: audio, at: cursor)
+                }
+                cursor = CMTimeAdd(cursor, range.duration)
+            } catch {
+                Log.write("[合并] 拼接失败 \(error.localizedDescription)")
+            }
+        }
+        guard inserted > 0,
+              let exporter = AVAssetExportSession(asset: composition,
+                                                  presetName: AVAssetExportPresetPassthrough) else {
+            return false
+        }
+        try? FileManager.default.removeItem(at: output)
+        exporter.outputURL = output
+        exporter.outputFileType = .mp4
+        let done = DispatchSemaphore(value: 0)
+        exporter.exportAsynchronously { done.signal() }
+        done.wait()
+        let ok = exporter.status == .completed
+        if ok {
+            Log.write("[合并] 拼接方式成功 \(inserted)段")
+        } else {
+            Log.write("[合并] 拼接方式失败 status=\(exporter.status.rawValue) \(exporter.error?.localizedDescription ?? "")")
+        }
+        return ok
+    }
+
+    private static func readSamples(_ asset: AVURLAsset, media: AVMediaType, quiet: Bool = false) -> [CMSampleBuffer] {
+        guard let track = asset.tracks(withMediaType: media).first else {
+            if !quiet { Log.write("[合并] 该段没有 \(media.rawValue) 轨道") }
+            return []
+        }
+        guard let reader = try? AVAssetReader(asset: asset) else {
+            if !quiet { Log.write("[合并] 创建读取器失败") }
+            return []
+        }
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         output.alwaysCopiesSampleData = true
-        guard reader.canAdd(output) else { return [] }
+        guard reader.canAdd(output) else {
+            if !quiet { Log.write("[合并] 无法挂载读取输出") }
+            return []
+        }
         reader.add(output)
-        guard reader.startReading() else { return [] }
+        guard reader.startReading() else {
+            if !quiet { Log.write("[合并] 开始读取失败 status=\(reader.status.rawValue) \(reader.error?.localizedDescription ?? "")") }
+            return []
+        }
         var samples: [CMSampleBuffer] = []
         while let sample = output.copyNextSampleBuffer() { samples.append(sample) }
+        if samples.isEmpty && !quiet {
+            Log.write("[合并] 该段读不到样本 status=\(reader.status.rawValue) \(reader.error?.localizedDescription ?? "")")
+        }
         reader.cancelReading()
         return samples
     }
