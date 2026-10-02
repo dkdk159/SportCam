@@ -231,6 +231,8 @@ final class SegmentRecorder {
         let seconds: Double
         /// 本段第一个视频帧的时间戳（用于按真实先后排序）
         let start: CMTime
+        /// 本段开写时的真实时间（水印要用它换算每一帧的墙上时间）
+        let createdAt: Date
     }
 
     private let queue = DispatchQueue(label: "com.sportcam.segmenter")
@@ -246,6 +248,7 @@ final class SegmentRecorder {
     private var videoInput: AVAssetWriterInput?
     private var currentURL: URL?
     private var segmentStart = CMTime.invalid
+    private var segmentStartDate = Date()
     private var lastVideoPTS = CMTime.invalid
 
     // 连续音轨：整段会话只有一个音频编码器，中途不重启
@@ -523,6 +526,7 @@ final class SegmentRecorder {
             videoInput = video
             currentURL = url
             segmentStart = time
+            segmentStartDate = Date()
             // 注意：这里不能把 lastVideoPTS 设成 time，
             // 否则下面"时间戳必须递增"的判断会把本段的第一个关键帧直接丢掉 ——
             // 段首没有关键帧，合并时就会读不出视频格式。
@@ -537,6 +541,7 @@ final class SegmentRecorder {
     private func finishCurrentSegment(intoClip: Bool, discard: Bool = false) {
         guard let assetWriter = writer, let url = currentURL else { return }
         let segmentBegin = segmentStart
+        let segmentBeginDate = segmentStartDate
         let rawSeconds = (segmentStart.isValid && lastVideoPTS.isValid)
             ? max(CMTimeGetSeconds(CMTimeSubtract(lastVideoPTS, segmentStart)), 0)
             : 0
@@ -551,7 +556,7 @@ final class SegmentRecorder {
         lastVideoPTS = .invalid
 
         pendingFinishes += 1
-        let segment = Segment(url: url, seconds: seconds, start: segmentBegin)
+        let segment = Segment(url: url, seconds: seconds, start: segmentBegin, createdAt: segmentBeginDate)
         let useClip = intoClip
         assetWriter.finishWriting { [weak self] in
             guard let self = self else { return }
@@ -600,7 +605,9 @@ final class SegmentRecorder {
     private func completeEndIfReady() {
         guard let completion = endCompletion, pendingFinishes == 0 else { return }
         endCompletion = nil
-        let recorded = clip.map { RecordedSegment(url: $0.url, start: $0.start, seconds: $0.seconds) }
+        let recorded = clip.map {
+            RecordedSegment(url: $0.url, start: $0.start, seconds: $0.seconds, createdAt: $0.createdAt)
+        }
         clip.removeAll()
         clipMode = false
         let audio = finishedTrack
@@ -617,6 +624,8 @@ struct RecordedSegment {
     let url: URL
     let start: CMTime
     let seconds: Double
+    /// 本段开写时的真实时间
+    let createdAt: Date
 }
 
 /// 一条连续音轨文件（整个预录/录制期间只有这一个音频编码器）。
@@ -644,15 +653,20 @@ struct RecordedClip {
 ///   initWithAsset:presetName: / setOutputFileType: / setShouldOptimizeForNetworkUse: /
 ///   exportAsynchronouslyWithCompletionHandler:
 enum SegmentMerger {
-    static func merge(_ clip: RecordedClip, to output: URL, completion: @escaping (Bool) -> Void) {
+    /// - Parameter watermark: 非空时把「时间 + 地点」烧进画面（必须重编码）；
+    ///                        nil 时保持原样的无损 Passthrough。
+    static func merge(_ clip: RecordedClip, to output: URL,
+                      watermark: WatermarkConfig? = nil,
+                      completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let ok = compose(clip, to: output)
+            let ok = compose(clip, to: output, watermark: watermark)
             DispatchQueue.main.async { completion(ok) }
         }
     }
 
-    /// 合成：分段首尾相接 + 连续音轨整段插入，然后无损导出。
-    private static func compose(_ clip: RecordedClip, to output: URL) -> Bool {
+    /// 合成：分段首尾相接 + 连续音轨整段插入，然后导出。
+    private static func compose(_ clip: RecordedClip, to output: URL,
+                                watermark: WatermarkConfig?) -> Bool {
         let valid = clip.segments
             .filter { FileManager.default.fileExists(atPath: $0.url.path) && $0.start.isValid }
             .sorted { CMTimeCompare($0.start, $1.start) < 0 }
@@ -714,22 +728,34 @@ enum SegmentMerger {
         }
 
         let began = Date()
-        var ok = export(composition, to: output, preset: AVAssetExportPresetPassthrough)
-        if !ok {
-            // 分段格式万一不一致，Passthrough 会拒；退回最高画质重编码一次
-            Log.write("[合并] 无损导出失败，改用 HighestQuality 重试")
-            ok = export(composition, to: output, preset: AVAssetExportPresetHighestQuality)
+        let videoComposition = watermark.flatMap { WatermarkComposition.make(asset: composition, config: $0) }
+        var ok: Bool
+        if let videoComposition = videoComposition {
+            // 叠了水印就没法走 Passthrough（系统会拒绝），只能重编码一次
+            ok = export(composition, videoComposition: videoComposition, to: output,
+                        preset: AVAssetExportPresetHighestQuality)
+        } else {
+            ok = export(composition, videoComposition: nil, to: output,
+                        preset: AVAssetExportPresetPassthrough)
+            if !ok {
+                // 分段格式万一不一致，Passthrough 会拒；退回最高画质重编码一次
+                Log.write("[合并] 无损导出失败，改用 HighestQuality 重试")
+                ok = export(composition, videoComposition: nil, to: output,
+                            preset: AVAssetExportPresetHighestQuality)
+            }
         }
         let usedMS = Int(Date().timeIntervalSince(began) * 1000)
         if ok {
             let seconds = String(format: "%.1f", CMTimeGetSeconds(composition.duration))
-            Log.write("[合并] 成功 \(inserted)段 时长\(seconds)秒 用时\(usedMS)ms")
+            let mark = watermark == nil ? "无水印" : "已加水印"
+            Log.write("[合并] 成功 \(inserted)段 \(mark) 时长\(seconds)秒 用时\(usedMS)ms")
         }
         return ok
     }
 
     /// 导出。参考 App 用的就是 .mov + shouldOptimizeForNetworkUse。
-    private static func export(_ composition: AVAsset, to output: URL, preset: String) -> Bool {
+    private static func export(_ composition: AVAsset, videoComposition: AVVideoComposition?,
+                               to output: URL, preset: String) -> Bool {
         guard let exporter = AVAssetExportSession(asset: composition, presetName: preset) else {
             Log.write("[合并] 无法创建导出会话 preset=\(preset)")
             return false
@@ -738,6 +764,7 @@ enum SegmentMerger {
         exporter.outputURL = output
         exporter.outputFileType = .mov
         exporter.shouldOptimizeForNetworkUse = true
+        exporter.videoComposition = videoComposition
         let done = DispatchSemaphore(value: 0)
         exporter.exportAsynchronously { done.signal() }
         done.wait()

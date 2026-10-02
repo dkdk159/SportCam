@@ -415,6 +415,10 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var voiceOn = true { didSet { if oldValue != voiceOn { voiceOn ? startVoice() : stopVoice() } } }
     @Published var startWords = ["开始录像", "开启录像", "开始录制", "开始拍摄"]
     @Published var stopWords = ["停止录像", "结束录像", "关闭录像", "停止录制", "保存"]
+    /// 时间地点水印：独立功能，打开才定位、才写进视频
+    @Published var watermarkOn = false { didSet { if oldValue != watermarkOn { syncWatermark() } } }
+    /// 当前地名（开启水印后由定位反查得到）
+    @Published var watermarkPlace = ""
 
     let session = AVCaptureSession()
     let level = LevelSensor()
@@ -425,6 +429,7 @@ final class CameraEngine: NSObject, ObservableObject {
     private let encoder = H264Encoder()
     private let recorder = SegmentRecorder()
     private let sound = SoundPlayer()
+    private let locator = LocationProvider()
     private let voice = VoiceControl()
     private let power = PowerMonitor()
 
@@ -465,6 +470,17 @@ final class CameraEngine: NSObject, ObservableObject {
 
         recorder.onSegmentsChanged = { [weak self] total in
             self?.segmentCount = total
+        }
+
+        // 地名只在水印开着时才需要
+        locator.onPlace = { [weak self] text in
+            guard let self = self, self.watermarkPlace != text else { return }
+            self.watermarkPlace = text
+            Log.write("[水印] 地点：\(text)")
+        }
+        locator.onFailure = { [weak self] reason in
+            guard let self = self else { return }
+            if self.watermarkPlace.isEmpty { self.watermarkPlace = reason }
         }
 
         uiTimer?.invalidate()
@@ -1061,6 +1077,18 @@ final class CameraEngine: NSObject, ObservableObject {
         recorder.arm(preRecordSeconds: Double(preRecordDelay.rawValue))
     }
 
+    /// 水印开关：打开才开始定位，关掉立刻停，不留后台定位
+    private func syncWatermark() {
+        if watermarkOn {
+            Log.write("[水印] 开启")
+            locator.start()
+        } else {
+            locator.stop()
+            watermarkPlace = ""
+            Log.write("[水印] 关闭")
+        }
+    }
+
     // MARK: 录制
     func startRecording() {
         stateLock.lock()
@@ -1122,7 +1150,12 @@ final class CameraEngine: NSObject, ObservableObject {
                 return
             }
             let output = self.nextClipURL()
-            SegmentMerger.merge(clip, to: output) { ok in
+            // 水印：视频第 0 秒 = 最早那段开始写盘的真实时刻
+            let mark: WatermarkConfig? = self.watermarkOn ? WatermarkConfig(
+                place: self.watermarkPlace,
+                startDate: clip.segments.map { $0.createdAt }.min() ?? Date()
+            ) : nil
+            SegmentMerger.merge(clip, to: output, watermark: mark) { ok in
                 for seg in clip.segments { try? FileManager.default.removeItem(at: seg.url) }
                 if let audio = clip.audio { try? FileManager.default.removeItem(at: audio.url) }
                 guard ok else {

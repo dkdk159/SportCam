@@ -2,6 +2,7 @@ import SwiftUI
 import AVFoundation
 import AVKit
 import UIKit
+import Combine
 
 // ============================================================
 //  界面：竖屏，布局对齐苹果自带相机；功能保持大疆那套
@@ -101,6 +102,40 @@ private struct CircleIcon: View {
                 .overlay(Circle().stroke(active ? tint.opacity(0.75) : Palette.border, lineWidth: 1))
         }
         .buttonStyle(PlainButtonStyle())
+    }
+}
+
+/// 预览上的水印：只是位置示意，真正烧进视频的那一份在导出时绘制。
+/// 只有设置里打开「时间地点水印」才出现在画面上。
+private struct WatermarkPreview: View {
+    let place: String
+    @State private var now = Date()
+    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    private static let formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(WatermarkPreview.formatter.string(from: now))
+            if !place.isEmpty { Text(place) }
+        }
+        .font(.system(size: 12, weight: .semibold))
+        .foregroundColor(.white)
+        .shadow(color: .black.opacity(0.8), radius: 2, x: 0, y: 1)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 5)
+        .background(Color.black.opacity(0.26))
+        .cornerRadius(6)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .padding(.leading, 12)
+        .padding(.bottom, 148)
+        .onReceive(tick) { now = $0 }
+        .allowsHitTesting(false)
     }
 }
 
@@ -234,6 +269,11 @@ struct CameraScreen: View {
                 )
 
             if engine.showGrid { GridOverlay().ignoresSafeArea() }
+
+            // 水印：开关打开才显示，位置对齐最终烧进视频的左下角
+            if engine.watermarkOn {
+                WatermarkPreview(place: engine.watermarkPlace)
+            }
 
             if let point = focusReticle {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -735,6 +775,19 @@ struct SettingsSheet: View {
                     Picker("防抖", selection: $engine.antiShake) {
                         ForEach(AntiShake.allCases) { Text($0.rawValue).tag($0) }
                     }.disabled(engine.isRecording)
+                }
+
+                Section(header: Text("水印"),
+                        footer: Text("开启后会把「时间 + 地点」烧进视频左下角，预览上同款显示。需要定位权限；关闭时完全不定位、不写入画面。")) {
+                    Toggle("时间地点水印", isOn: $engine.watermarkOn)
+                    if engine.watermarkOn {
+                        HStack {
+                            Text("当前地点")
+                            Spacer()
+                            Text(engine.watermarkPlace.isEmpty ? "定位中…" : engine.watermarkPlace)
+                                .foregroundColor(.secondary)
+                        }
+                    }
                 }
 
                 Section(header: Text("预录"),
