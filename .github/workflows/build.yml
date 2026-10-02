@@ -31,6 +31,7 @@ jobs:
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGNING_ALLOWED=NO \
           ONLY_ACTIVE_ARCH=NO \
+          ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES=NO \
           build 2>&1 | tee build.log | tail -n 150
 
     - name: Print compile errors
