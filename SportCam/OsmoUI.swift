@@ -245,8 +245,21 @@ struct CameraScreen: View {
                 CircleIcon(icon: "ellipsis.circle") { showSettings = true }
             }
 
-            // 录制计时 / 预录中
-            if engine.isRecording {
+            // 录制计时 / 预录中 / 处理中
+            if engine.isBusy {
+                HStack(spacing: 7) {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: Palette.appleYellow))
+                        .scaleEffect(0.8)
+                    Text("正在保存到相册…")
+                        .font(Palette.mono(11))
+                        .foregroundColor(Palette.appleYellow)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(Color.black.opacity(0.55))
+                .clipShape(Capsule())
+            } else if engine.isRecording {
                 HStack(spacing: 7) {
                     Circle().fill(Palette.record).frame(width: 9, height: 9)
                     Text(timeText(engine.recordSeconds))
@@ -365,7 +378,11 @@ struct CameraScreen: View {
                 } label: {
                     ZStack {
                         Circle().stroke(Color.white, lineWidth: 4).frame(width: 78, height: 78)
-                        if engine.isRecording {
+                        if engine.isBusy {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle(tint: Palette.appleYellow))
+                                .scaleEffect(1.4)
+                        } else if engine.isRecording {
                             RoundedRectangle(cornerRadius: 7, style: .continuous)
                                 .fill(Palette.record)
                                 .frame(width: 34, height: 34)
@@ -375,6 +392,7 @@ struct CameraScreen: View {
                     }
                 }
                 .buttonStyle(PlainButtonStyle())
+                .disabled(engine.isBusy)
 
                 Spacer()
 

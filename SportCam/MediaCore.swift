@@ -4,8 +4,14 @@ import VideoToolbox
 import CoreMedia
 
 // ============================================================
-//  媒体核心：日志 / 环形缓冲 / sampleBuffer 工具 / H.264 编码器
-//            提示音 / 影片写入器
+//  媒体核心：日志 / sampleBuffer 工具 / H.264 编码器 / 提示音
+//           分段落盘录制器（行车记录仪架构） / 分段合并
+//
+//  架构说明：
+//  预录不再把帧囤在内存里（那样会把系统的缓冲池耗干 → 系统不报错、直接停帧，
+//  症状就是"画面卡在某一秒不动"）。改为：一边实时编码，一边以约 2 秒为单位
+//  滚动落盘成小分段文件，只保留最近若干段。内存里永远只有"正在写的那一帧"。
+//  按下录制 = 锁定当前保留段 + 继续录；停止 = 把这些段无损合并成一个文件存相册。
 // ============================================================
 
 // MARK: - 调试日志（屏幕可见，出问题自动弹出）
@@ -30,48 +36,6 @@ enum Log {
     static func write(_ text: String) { LogBuffer.add(text) }
 }
 
-// MARK: - 线程安全环形缓冲
-final class RingBuffer<T> {
-    private var storage: [T?]
-    private var writeIndex = 0
-    private(set) var count = 0
-    let capacity: Int
-    private let lock = NSLock()
-
-    init(capacity: Int) {
-        let safeCapacity = Swift.max(capacity, 1)
-        self.capacity = safeCapacity
-        self.storage = Array(repeating: nil, count: safeCapacity)
-    }
-
-    func append(_ element: T) {
-        lock.lock(); defer { lock.unlock() }
-        storage[writeIndex] = element
-        writeIndex = (writeIndex + 1) % capacity
-        count = Swift.min(count + 1, capacity)
-    }
-
-    /// 由旧到新返回所有元素
-    func snapshot() -> [T] {
-        lock.lock(); defer { lock.unlock() }
-        guard count > 0 else { return [] }
-        var result: [T] = []
-        result.reserveCapacity(count)
-        let start = count < capacity ? 0 : writeIndex
-        for offset in 0..<count {
-            if let element = storage[(start + offset) % capacity] { result.append(element) }
-        }
-        return result
-    }
-
-    func removeAll() {
-        lock.lock(); defer { lock.unlock() }
-        storage = Array(repeating: nil, count: capacity)
-        writeIndex = 0
-        count = 0
-    }
-}
-
 // MARK: - CMSampleBuffer 工具
 extension CMSampleBuffer {
     /// 关键帧（I 帧）。无附加信息时按关键帧处理。
@@ -79,25 +43,6 @@ extension CMSampleBuffer {
         guard let array = CMSampleBufferGetSampleAttachmentsArray(self, createIfNecessary: false) as? [[CFString: Any]],
               let first = array.first else { return true }
         return !(first[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
-    }
-
-    /// 保留拷贝：用于把 sampleBuffer 带到回调之外（存进预录缓冲、交给写入器）。
-    ///
-    /// 这里刻意"不"去替换 data buffer。
-    /// 之前用 CMSampleBufferSetDataBuffer 把数据搬到自己 malloc 的内存里，看起来更安全，
-    /// 实际上这个 API 会失败（返回 OSStatus，之前被忽略）——一旦失败，拷贝出来的 buffer
-    /// 仍然指向原始那块会被系统回收的内存：帧数据失效 → AVAssetWriter 大量拒收
-    /// （视频只剩两三秒）→ 严重时变成悬垂指针直接闪退。
-    ///
-    /// CMSampleBufferCreateCopy 会 retain 内部 blockBuffer（引用计数），
-    /// 池子不会回收仍被持有的内存，这是官方推荐的"延长 sampleBuffer 生命周期"的方式。
-    /// VideoToolbox 编码产出的帧内存本就由我们独占，同样直接 retain 即可。
-    func retainedCopy() -> CMSampleBuffer? {
-        var copy: CMSampleBuffer?
-        let status = CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault,
-                                              sampleBuffer: self,
-                                              sampleBufferOut: &copy)
-        return status == noErr ? copy : nil
     }
 
     func pcmBuffer() -> AVAudioPCMBuffer? {
@@ -128,7 +73,6 @@ final class H264Encoder {
     private let lock = NSLock()
     var onSample: ((CMSampleBuffer) -> Void)?
 
-    /// 编码器是否可用。创建失败或被系统回收后为 false，由引擎按 1 秒节流自动重建。
     var isReady: Bool {
         lock.lock(); defer { lock.unlock() }
         return session != nil
@@ -170,8 +114,8 @@ final class H264Encoder {
         set(encoder, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel)
         set(encoder, kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: bitrate))
         set(encoder, kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: fps))
-        // 帧数 + 时间 双保险，保证预录缓冲里总能找到可解码的起点
-        set(encoder, kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: Swift.max(fps, 15)))
+        // 关键帧间隔控制在一秒内：分段要在关键帧处切，合并才能无损
+        set(encoder, kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: max(fps, 15)))
         set(encoder, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 1.0))
         VTCompressionSessionPrepareToEncodeFrames(encoder)
 
@@ -185,6 +129,7 @@ final class H264Encoder {
         if status != noErr { Log.write("[编码] 参数失败 \(key) st=\(status)") }
     }
 
+    /// forceKey：请求本帧输出为关键帧（分段边界 / 录制起点要用）
     func encode(_ pixelBuffer: CVPixelBuffer, at time: CMTime, forceKey: Bool) {
         lock.lock()
         let current = session
@@ -212,11 +157,10 @@ final class H264Encoder {
     }
 }
 
-// MARK: - 提示音（进程内合成，走扬声器；录音会话下 AudioServices 听不到）
+// MARK: - 提示音
 final class SoundPlayer {
     private let queue = DispatchQueue(label: "com.sportcam.sound")
     private var player: AVAudioPlayer?
-    // 大疆式：三连"滴"（开始） / 单声长"滴"（停止）
     private lazy var startTone = Self.makeTone([(0.00, 0.07), (0.12, 0.07), (0.24, 0.16)])
     private lazy var stopTone = Self.makeTone([(0.00, 0.20)])
 
@@ -269,275 +213,356 @@ final class SoundPlayer {
     }
 }
 
-// MARK: - 影片写入器（预录历史帧 + 实时帧）
+// MARK: - 分段落盘录制器
 ///
-/// 三条写死的规矩（都是踩坑换来的）：
-/// 1. expectsMediaDataInRealTime = false —— 预录帧是历史数据，设 true 会被按实时速度节流并丢帧。
-/// 2. 每次 append 前必须 isReadyForMoreMediaData —— 盲目 append 会阻塞/抛异常。
-/// 3. PTS 必须单调递增，音频不得早于视频起点。
-/// 实时帧进"积压队列"，就绪即排空，不丢帧。
-final class ClipWriter {
-    private let queue = DispatchQueue(label: "com.sportcam.writer")
+/// 预录的"缓冲"落在磁盘上：边编码边写小分段，只保留最近 N 秒对应的若干段。
+/// 内存里不囤任何帧 → 不会耗尽系统缓冲池，也就不会出现"画面突然卡住不再出帧"。
+final class SegmentRecorder {
+
+    private struct Segment {
+        let url: URL
+        let seconds: Double
+    }
+
+    private let queue = DispatchQueue(label: "com.sportcam.segmenter")
+    private let folder: URL
+
+    // 运行状态（只在 queue 上访问）
+    private var armed = false            // 是否在滚动写盘（预录中）
+    private var clipMode = false         // 是否处于"正式录制"（此时不删段）
+    private var keepSeconds: Double = 15
+    private var segmentSeconds: Double = 2.0
+
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
     private var audioInput: AVAssetWriterInput?
-    private var outputURL: URL?
-    private var running = false
-
-    private var videoWritten = 0
-    private var audioWritten = 0
+    private var currentURL: URL?
+    private var segmentStart = CMTime.invalid
     private var lastVideoPTS = CMTime.invalid
     private var lastAudioPTS = CMTime.invalid
-    private var videoBacklog: [CMSampleBuffer] = []
-    private var audioBacklog: [CMSampleBuffer] = []
-    private let backlogLimit = 300
+    private var audioFormat: CMFormatDescription?
 
-    func start(video: [CMSampleBuffer],
-               audio: [CMSampleBuffer],
-               url: URL,
-               transform: CGAffineTransform?,
-               completion: @escaping (Bool) -> Void) {
+    private var rolling: [Segment] = []      // 可被淘汰的滚动段
+    private var clip: [Segment] = []         // 正式录制期间累计的段
+
+    private var pendingFinishes = 0
+    private var endCompletion: (([URL]) -> Void)?
+    private var sequence = 0
+
+    /// 分段数量变化通知（主线程回调，供界面显示）
+    var onSegmentsChanged: ((Int) -> Void)?
+
+    init() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        folder = docs.appendingPathComponent("Segments", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    }
+
+    // MARK: 对外接口
+    /// 进入预录：开始滚动写盘，保留最近 preRecordSeconds 秒
+    func arm(preRecordSeconds: Double) {
         queue.async { [weak self] in
-            guard let self = self else { DispatchQueue.main.async { completion(false) }; return }
-            if self.running {
-                Log.write("[写入] 上一段未收尾，强制取消")
-                self.writer?.cancelWriting()
-                self.resetLocked()
+            guard let self = self else { return }
+            self.keepSeconds = max(preRecordSeconds, 1)
+            if !self.armed {
+                self.armed = true
+                Log.write("[预录] 开始滚动写盘 保留\(Int(preRecordSeconds))秒")
             }
-            guard let first = video.first, let format = CMSampleBufferGetFormatDescription(first) else {
-                Log.write("[写入] 没有可用视频帧")
-                DispatchQueue.main.async { completion(false) }
-                return
-            }
-            let startTime = presentationTime(first)
-
-            do {
-                if FileManager.default.fileExists(atPath: url.path) {
-                    try? FileManager.default.removeItem(at: url)
-                }
-                let assetWriter = try AVAssetWriter(outputURL: url, fileType: .mp4)
-
-                let videoTrack = AVAssetWriterInput(mediaType: .video,
-                                                    outputSettings: nil,
-                                                    sourceFormatHint: format)
-                videoTrack.expectsMediaDataInRealTime = false
-                if let transform = transform { videoTrack.transform = transform }
-                guard assetWriter.canAdd(videoTrack) else {
-                    Log.write("[写入] 视频轨添加失败")
-                    DispatchQueue.main.async { completion(false) }
-                    return
-                }
-                assetWriter.add(videoTrack)
-
-                let validAudio = audio.filter { CMTimeCompare(presentationTime($0), startTime) >= 0 }
-                let audioTrack = AVAssetWriterInput(mediaType: .audio,
-                                                    outputSettings: [AVFormatIDKey: kAudioFormatMPEG4AAC,
-                                                                     AVEncoderBitRateKey: 128000],
-                                                    sourceFormatHint: validAudio.first.flatMap { CMSampleBufferGetFormatDescription($0) })
-                audioTrack.expectsMediaDataInRealTime = false
-                let hasAudio = assetWriter.canAdd(audioTrack)
-                if hasAudio { assetWriter.add(audioTrack) }
-
-                guard assetWriter.startWriting() else {
-                    Log.write("[写入] startWriting 失败 \(assetWriter.error?.localizedDescription ?? "")")
-                    DispatchQueue.main.async { completion(false) }
-                    return
-                }
-                assetWriter.startSession(atSourceTime: startTime)
-
-                self.writer = assetWriter
-                self.videoInput = videoTrack
-                self.audioInput = hasAudio ? audioTrack : nil
-                self.outputURL = url
-                self.videoWritten = 0
-                self.audioWritten = 0
-                self.lastVideoPTS = startTime
-                self.lastAudioPTS = .invalid
-                self.videoBacklog.removeAll()
-                self.audioBacklog.removeAll()
-                self.running = true
-
-                self.writePreRecorded(video: video, audio: validAudio)
-                Log.write("[写入] 就绪 预录v=\(video.count) 已写v=\(self.videoWritten) 音频=\(hasAudio)")
-                DispatchQueue.main.async { completion(true) }
-            } catch {
-                Log.write("[写入] 异常 \(error.localizedDescription)")
-                self.resetLocked()
-                DispatchQueue.main.async { completion(false) }
-            }
+            self.trimRolling()
+            self.notifySegments()
         }
     }
 
-    /// 预录历史帧：按 PTS 交错写入
-    private func writePreRecorded(video: [CMSampleBuffer], audio: [CMSampleBuffer]) {
-        guard let videoTrack = videoInput else { return }
-        let began = Date()
-        var videoIndex = 0
-        var audioIndex = 0
-        var rejected = 0
-        let deadline = began.addingTimeInterval(12)
-
-        while (videoIndex < video.count || audioIndex < audio.count) && Date() < deadline {
-            // 写入器一旦失败立即退出，绝不空等（否则会堵死整个写入队列，导致后续点击无反应）
-            if let assetWriter = writer, assetWriter.status != .writing {
-                Log.write("[写入] 预录写入中止 status=\(assetWriter.status.rawValue) \(assetWriter.error?.localizedDescription ?? "")")
-                break
-            }
-
-            let audioTrack = audioInput
-            let videoReady = videoTrack.isReadyForMoreMediaData
-            let audioReady = audioTrack?.isReadyForMoreMediaData ?? false
-            let hasVideo = videoIndex < video.count
-            let hasAudio = audioTrack != nil && audioIndex < audio.count
-
-            // 按 PTS 决定先写谁
-            var pickVideo: Bool
-            if !hasAudio {
-                pickVideo = true
-            } else if !hasVideo {
-                pickVideo = false
-            } else {
-                pickVideo = CMTimeCompare(presentationTime(video[videoIndex]),
-                                          presentationTime(audio[audioIndex])) <= 0
-            }
-            // 选中的那条轨没就绪就改走另一条。
-            // 否则音频轨一慢，整段预录写入会被卡住 —— 表现就是"视频只有两三秒"。
-            if pickVideo, !videoReady, audioReady {
-                pickVideo = false
-            } else if !pickVideo, !audioReady, videoReady {
-                pickVideo = true
-            }
-
-            if pickVideo, hasVideo, videoReady {
-                if videoTrack.append(video[videoIndex]) {
-                    videoWritten += 1
-                    lastVideoPTS = presentationTime(video[videoIndex])
-                } else {
-                    rejected += 1
-                }
-                videoIndex += 1
-            } else if !pickVideo, hasAudio, audioReady, let target = audioTrack {
-                if target.append(audio[audioIndex]) {
-                    audioWritten += 1
-                    lastAudioPTS = presentationTime(audio[audioIndex])
-                } else {
-                    rejected += 1
-                }
-                audioIndex += 1
-            } else {
-                Thread.sleep(forTimeInterval: 0.002)
-            }
+    /// 退出预录：停止写盘并清掉滚动段
+    func disarm() {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            guard !self.clipMode else { return }
+            self.armed = false
+            self.clearRolling()
+            self.finishCurrentSegment(intoClip: false, discard: true)
+            Log.write("[预录] 已停止")
         }
-        let usedMS = Int(Date().timeIntervalSince(began) * 1000)
-        Log.write("[写入] 预录写入 用时\(usedMS)ms 写v=\(videoWritten) 拒收=\(rejected) 剩v=\(video.count - videoIndex)")
+    }
+
+    /// 按下录制：把当前保留的滚动段锁定为预录部分，并从此不再淘汰
+    func beginClip() {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            self.clipMode = true
+            self.clip.append(contentsOf: self.rolling)
+            let carried = self.rolling.count
+            self.rolling.removeAll()
+            self.notifySegments()
+            Log.write("[录制] 锁定预录段 \(carried) 个")
+        }
+    }
+
+    /// 停止录制：收尾当前段，返回按时间顺序排列的全部分段
+    func endClip(completion: @escaping ([URL]) -> Void) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            self.armed = false
+            self.endCompletion = completion
+            if self.writer != nil {
+                self.finishCurrentSegment(intoClip: true)
+            }
+            self.completeEndIfReady()
+        }
     }
 
     func appendVideo(_ sample: CMSampleBuffer) {
-        queue.async { [weak self] in
-            guard let self = self, self.running,
-                  let assetWriter = self.writer, assetWriter.status == .writing else { return }
-            if self.videoBacklog.count > self.backlogLimit { self.videoBacklog.removeFirst() }
-            self.videoBacklog.append(sample)
-            self.drainVideo()
-        }
+        queue.async { [weak self] in self?.handleVideo(sample) }
     }
 
     func appendAudio(_ sample: CMSampleBuffer) {
-        queue.async { [weak self] in
-            guard let self = self, self.running,
-                  let assetWriter = self.writer, assetWriter.status == .writing else { return }
-            if self.audioBacklog.count > self.backlogLimit { self.audioBacklog.removeFirst() }
-            self.audioBacklog.append(sample)
-            self.drainAudio()
-        }
+        queue.async { [weak self] in self?.handleAudio(sample) }
     }
 
-    private func drainVideo() {
-        guard let videoTrack = videoInput,
-              let assetWriter = writer, assetWriter.status == .writing else { return }
-        while !videoBacklog.isEmpty {
-            guard videoTrack.isReadyForMoreMediaData else { return }
-            let sample = videoBacklog.removeFirst()
-            let time = presentationTime(sample)
-            if lastVideoPTS.isValid && CMTimeCompare(time, lastVideoPTS) <= 0 { continue }
-            lastVideoPTS = time
-            if videoTrack.append(sample) { videoWritten += 1 }
-        }
-    }
-
-    private func drainAudio() {
-        guard let audioTrack = audioInput,
-              let assetWriter = writer, assetWriter.status == .writing else { return }
-        while !audioBacklog.isEmpty {
-            guard audioTrack.isReadyForMoreMediaData else { return }
-            let sample = audioBacklog.removeFirst()
-            let time = presentationTime(sample)
-            if lastAudioPTS.isValid && CMTimeCompare(time, lastAudioPTS) <= 0 { continue }
-            lastAudioPTS = time
-            if audioTrack.append(sample) { audioWritten += 1 }
-        }
-    }
-
-    func finish(completion: @escaping (URL?) -> Void) {
-        queue.async { [weak self] in
-            guard let self = self, self.running, let assetWriter = self.writer else {
-                DispatchQueue.main.async { completion(nil) }
-                return
-            }
-            self.running = false
-            let url = self.outputURL
-
-            // 收尾前把积压写完
-            let deadline = Date().addingTimeInterval(3)
-            while (!self.videoBacklog.isEmpty || !self.audioBacklog.isEmpty)
-                    && Date() < deadline && assetWriter.status == .writing {
-                self.drainVideo()
-                self.drainAudio()
-                if !self.videoBacklog.isEmpty || !self.audioBacklog.isEmpty {
-                    Thread.sleep(forTimeInterval: 0.005)
-                }
-            }
-            let writtenFrames = self.videoWritten
-            Log.write("[写入] 收尾 视频帧=\(writtenFrames) 音频帧=\(self.audioWritten) 积压=\(self.videoBacklog.count)")
-
-            if writtenFrames == 0 {
-                Log.write("[写入] 无有效视频帧，取消")
-                assetWriter.cancelWriting()
-                self.resetLocked()
-                DispatchQueue.main.async { completion(nil) }
-                return
-            }
-
-            self.videoInput?.markAsFinished()
-            self.audioInput?.markAsFinished()
-            assetWriter.finishWriting {
-                let ok = (assetWriter.status == .completed)
-                Log.write("[写入] 完成 ok=\(ok) \(assetWriter.error?.localizedDescription ?? "")")
-                DispatchQueue.main.async { completion(ok ? url : nil) }
-            }
-            self.resetLocked()
-        }
-    }
-
-    func cancel() {
+    /// 丢弃（异常时复位用）
+    func reset() {
         queue.async { [weak self] in
             guard let self = self else { return }
-            if self.running { self.writer?.cancelWriting() }
-            self.resetLocked()
+            self.armed = false
+            self.clipMode = false
+            self.clearRolling()
+            let leftovers = self.clip
+            self.clip.removeAll()
+            for segment in leftovers { try? FileManager.default.removeItem(at: segment.url) }
+            self.finishCurrentSegment(intoClip: false, discard: true)
+            self.notifySegments()
         }
     }
 
-    private func resetLocked() {
+    // MARK: 内部
+    private func handleVideo(_ sample: CMSampleBuffer) {
+        guard armed else { return }
+        let time = presentationTime(sample)
+        let isKey = sample.isSync
+
+        let needNew = (writer == nil) || (isKey && shouldRotate(at: time))
+        if needNew {
+            guard isKey else { return }
+            finishCurrentSegment(intoClip: clipMode)
+            guard startSegment(with: sample, at: time) else { return }
+        }
+
+        guard let input = videoInput, let w = writer, w.status == .writing else { return }
+        if lastVideoPTS.isValid && CMTimeCompare(time, lastVideoPTS) <= 0 { return }
+        // 实时写入：未就绪就丢这一帧（阻塞会拖垮采集线程）
+        guard input.isReadyForMoreMediaData else { return }
+        if input.append(sample) { lastVideoPTS = time }
+    }
+
+    private func shouldRotate(at time: CMTime) -> Bool {
+        guard segmentStart.isValid else { return false }
+        return CMTimeGetSeconds(CMTimeSubtract(time, segmentStart)) >= segmentSeconds
+    }
+
+    private func handleAudio(_ sample: CMSampleBuffer) {
+        guard armed else { return }
+        if let format = CMSampleBufferGetFormatDescription(sample) { audioFormat = format }
+        guard writer != nil, segmentStart.isValid else { return }
+        let time = presentationTime(sample)
+        // 段的音频不得早于该段视频起点
+        if CMTimeCompare(time, segmentStart) < 0 { return }
+        guard let input = audioInput, let w = writer, w.status == .writing else { return }
+        if lastAudioPTS.isValid && CMTimeCompare(time, lastAudioPTS) <= 0 { return }
+        guard input.isReadyForMoreMediaData else { return }
+        if input.append(sample) { lastAudioPTS = time }
+    }
+
+    private func startSegment(with sample: CMSampleBuffer, at time: CMTime) -> Bool {
+        guard let format = CMSampleBufferGetFormatDescription(sample) else { return false }
+        sequence += 1
+        let url = folder.appendingPathComponent("seg_\(Int(Date().timeIntervalSince1970))_\(sequence).mp4")
+        do {
+            if FileManager.default.fileExists(atPath: url.path) { try? FileManager.default.removeItem(at: url) }
+            let assetWriter = try AVAssetWriter(outputURL: url, fileType: .mp4)
+
+            let video = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: format)
+            video.expectsMediaDataInRealTime = true
+            guard assetWriter.canAdd(video) else { return false }
+            assetWriter.add(video)
+
+            var audio: AVAssetWriterInput?
+            if let audioFormat = audioFormat {
+                let candidate = AVAssetWriterInput(mediaType: .audio,
+                                                   outputSettings: [AVFormatIDKey: kAudioFormatMPEG4AAC,
+                                                                    AVEncoderBitRateKey: 128000],
+                                                   sourceFormatHint: audioFormat)
+                candidate.expectsMediaDataInRealTime = true
+                if assetWriter.canAdd(candidate) {
+                    assetWriter.add(candidate)
+                    audio = candidate
+                }
+            }
+
+            guard assetWriter.startWriting() else {
+                Log.write("[分段] startWriting 失败 \(assetWriter.error?.localizedDescription ?? "")")
+                return false
+            }
+            assetWriter.startSession(atSourceTime: time)
+
+            writer = assetWriter
+            videoInput = video
+            audioInput = audio
+            currentURL = url
+            segmentStart = time
+            lastVideoPTS = time
+            lastAudioPTS = .invalid
+            return true
+        } catch {
+            Log.write("[分段] 创建失败 \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func finishCurrentSegment(intoClip: Bool, discard: Bool = false) {
+        guard let assetWriter = writer, let url = currentURL else { return }
+        let seconds = segmentStart.isValid
+            ? max(CMTimeGetSeconds(CMTimeSubtract(lastVideoPTS, segmentStart)), 0)
+            : 0
+
+        videoInput?.markAsFinished()
+        audioInput?.markAsFinished()
+
         writer = nil
         videoInput = nil
         audioInput = nil
-        outputURL = nil
-        running = false
-        videoBacklog.removeAll()
-        audioBacklog.removeAll()
-        videoWritten = 0
-        audioWritten = 0
+        currentURL = nil
+        segmentStart = .invalid
         lastVideoPTS = .invalid
         lastAudioPTS = .invalid
+
+        pendingFinishes += 1
+        let segment = Segment(url: url, seconds: seconds)
+        let useClip = intoClip
+        assetWriter.finishWriting { [weak self] in
+            guard let self = self else { return }
+            self.queue.async {
+                if discard {
+                    try? FileManager.default.removeItem(at: segment.url)
+                } else if useClip {
+                    self.clip.append(segment)
+                } else {
+                    self.rolling.append(segment)
+                    self.trimRolling()
+                }
+                self.pendingFinishes -= 1
+                self.notifySegments()
+                self.completeEndIfReady()
+            }
+        }
+    }
+
+    private func notifySegments() {
+        let total = rolling.count + clip.count
+        DispatchQueue.main.async { [weak self] in self?.onSegmentsChanged?(total) }
+    }
+
+    private func trimRolling() {
+        var total = rolling.reduce(0) { $0 + $1.seconds }
+        while rolling.count > 1 && total > keepSeconds {
+            let removed = rolling.removeFirst()
+            total -= removed.seconds
+            try? FileManager.default.removeItem(at: removed.url)
+        }
+    }
+
+    private func clearRolling() {
+        for segment in rolling { try? FileManager.default.removeItem(at: segment.url) }
+        rolling.removeAll()
+    }
+
+    private func completeEndIfReady() {
+        guard let completion = endCompletion, pendingFinishes == 0 else { return }
+        endCompletion = nil
+        let urls = clip.map { $0.url }
+        clip.removeAll()
+        clipMode = false
+        notifySegments()
+        Log.write("[录制] 收尾完成 共\(urls.count)段")
+        DispatchQueue.main.async { completion(urls) }
+    }
+}
+
+// MARK: - 分段合并（无损 passthrough）
+enum SegmentMerger {
+    static func merge(_ urls: [URL], to output: URL, completion: @escaping (Bool) -> Void) {
+        let valid = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !valid.isEmpty else {
+            Log.write("[合并] 没有可用的分段")
+            completion(false)
+            return
+        }
+        // 只有一段：直接当成品用
+        if valid.count == 1 {
+            do {
+                if FileManager.default.fileExists(atPath: output.path) { try? FileManager.default.removeItem(at: output) }
+                try FileManager.default.copyItem(at: valid[0], to: output)
+                Log.write("[合并] 单段，直接使用")
+                completion(true)
+            } catch {
+                Log.write("[合并] 复制失败 \(error.localizedDescription)")
+                completion(false)
+            }
+            return
+        }
+
+        let composition = AVMutableComposition()
+        let videoTrack = composition.addMutableTrack(withMediaType: .video,
+                                                     preferredTrackID: kCMPersistentTrackID_Invalid)
+        let audioTrack = composition.addMutableTrack(withMediaType: .audio,
+                                                     preferredTrackID: kCMPersistentTrackID_Invalid)
+        var cursor = CMTime.zero
+        var insertedVideo = 0
+
+        for url in valid {
+            let asset = AVURLAsset(url: url)
+            let duration = asset.duration
+            guard duration.isValid, CMTimeCompare(duration, .zero) > 0 else { continue }
+            let range = CMTimeRange(start: .zero, duration: duration)
+            if let track = asset.tracks(withMediaType: .video).first, let target = videoTrack {
+                do {
+                    try target.insertTimeRange(range, of: track, at: cursor)
+                    insertedVideo += 1
+                } catch {
+                    Log.write("[合并] 插入视频段失败 \(error.localizedDescription)")
+                }
+            }
+            if let track = asset.tracks(withMediaType: .audio).first, let target = audioTrack {
+                try? target.insertTimeRange(range, of: track, at: cursor)
+            }
+            cursor = CMTimeAdd(cursor, duration)
+        }
+
+        guard insertedVideo > 0 else {
+            Log.write("[合并] 没有任何视频段被插入")
+            completion(false)
+            return
+        }
+
+        guard let exporter = AVAssetExportSession(asset: composition,
+                                                  presetName: AVAssetExportPresetPassthrough) else {
+            Log.write("[合并] 无法创建导出会话")
+            completion(false)
+            return
+        }
+        if FileManager.default.fileExists(atPath: output.path) { try? FileManager.default.removeItem(at: output) }
+        exporter.outputURL = output
+        exporter.outputFileType = .mp4
+        exporter.shouldOptimizeForNetworkUse = false
+        let began = Date()
+        exporter.exportAsynchronously {
+            let ok = exporter.status == .completed
+            let ms = Int(Date().timeIntervalSince(began) * 1000)
+            if ok {
+                Log.write("[合并] 成功 \(valid.count)段 用时\(ms)ms")
+            } else {
+                Log.write("[合并] 失败 status=\(exporter.status.rawValue) \(exporter.error?.localizedDescription ?? "")")
+            }
+            DispatchQueue.main.async { completion(ok) }
+        }
     }
 }
