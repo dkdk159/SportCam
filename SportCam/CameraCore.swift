@@ -270,18 +270,38 @@ final class VoiceControl {
         // 部分结果里关键词往往先于整句出现（先听见"开始"，"录像"两字才跟上）。
         // 所以除了整词匹配，再加一条宽松规则：动词 + "录/拍" 同时出现就算命中，
         // 口令能提前小半秒生效，不用等识别器把整句收尾 —— 这就是"语音迟钝"的来源之一。
-        let wantsStart = startWords.contains { clean.contains($0) }
-            || (Self.startVerbs.contains { clean.contains($0) } && Self.recordWords.contains { clean.contains($0) })
-        let wantsStop = stopWords.contains { clean.contains($0) }
-            || (Self.stopVerbs.contains { clean.contains($0) } && Self.recordWords.contains { clean.contains($0) })
+        //
+        // 关键：识别文本是"累积"的 —— 一次未结束的识别里，说过的词会一直留在前面。
+        // 所以不能"先看开始、再看停止"：只要说过"开始录像"，后面再说"停止录像"，
+        // 开始口令会永远抢先命中，"停止"就永远轮不到（用户说的"说停止录像也不行"）。
+        // 正确做法：看两个口令谁在文本里更靠后出现，靠后的那个才是用户最新说的一句。
+        let hasRecord = Self.recordWords.contains { clean.contains($0) }
+        let startKeys = startWords + (hasRecord ? Self.startVerbs : [])
+        let stopKeys = stopWords + (hasRecord ? Self.stopVerbs : [])
 
-        if wantsStart {
+        func lastIndex(_ words: [String]) -> String.Index? {
+            var found: String.Index?
+            for word in words {
+                if let range = clean.range(of: word, options: .backwards) {
+                    if found == nil || range.lowerBound > found! { found = range.lowerBound }
+                }
+            }
+            return found
+        }
+
+        let startAt = lastIndex(startKeys)
+        let stopAt = lastIndex(stopKeys)
+        // 靠后的口令胜出；只有一个命中就用它
+        let wantStart: Bool
+        if let s = startAt, let p = stopAt { wantStart = s > p } else { wantStart = startAt != nil }
+
+        if wantStart {
             if now.timeIntervalSince(lastStart) > 2.5 {
                 lastStart = now
                 Log.write("[语音] 命中开始口令")
                 DispatchQueue.main.async { [weak self] in self?.onStart?() }
             }
-        } else if wantsStop {
+        } else if stopAt != nil {
             if now.timeIntervalSince(lastStop) > 2.5 {
                 lastStop = now
                 Log.write("[语音] 命中停止口令")
@@ -449,8 +469,8 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var showGrid = true
     /// 左上角「剩余空间 / 可录时长」显示开关（默认关闭，设置里最末尾可打开）
     @Published var showStorage = false
-    /// 音量键 / iPhone 16 相机按钮：按一下开始 / 停止录像（设置里可关）
-    @Published var volumeKeyRecording = true
+    /// 音量键 / iPhone 16 相机按钮：按一下开始 / 停止录像（默认关闭，想用时在设置里自己打开）
+    @Published var volumeKeyRecording = false
     /// 画面中间那个"圆圈十字架"水平仪，默认不显示（设置 → 拍摄辅助 里可以打开）
     @Published var showLevel = false
     /// 降噪：音频风噪抑制 + 画面暗光降噪，哪个系统支持就开哪个
@@ -525,6 +545,8 @@ final class CameraEngine: NSObject, ObservableObject {
     private let formatCacheLock = NSLock()
     private var formatCache: [String: AVCaptureDevice.Format] = [:]
     private var deliveredSize = CGSize.zero
+    /// 最近一次真正写进设备的帧率（按活动格式夹过），用来纠偏界面上的帧率选项（sessionQueue 上读写）
+    private var appliedFPS = 0
     /// 最近一帧的像素缓冲（sessionQueue 上读写）。翻转前把它转成图片当过渡帧用。
     private var latestPixelBuffer: CVPixelBuffer?
     /// 转图片用，建一次复用；放 sessionQueue 上用
@@ -908,6 +930,9 @@ final class CameraEngine: NSObject, ObservableObject {
             if overlayShown { self.armFlipFadeOut() }
             DispatchQueue.main.async {
                 self.cameraPosition = next
+                // 换到另一颗摄像头后重算可用画质档：前置给不了 4K / 4:3，
+                // 当前档在新摄像头上不可用时自动落到能用的最高档并提示（"不会自适应"）。
+                self.refreshQualitiesAfterFlip(to: next)
                 // 先落 cameraPosition 再落 fieldOfView：前者已是 .front 时，
                 // fieldOfView 的 didSet 会走 switchLens，被"前置不支持切换焦段"挡掉，正好不动会话
                 self.fieldOfView = fov
@@ -955,7 +980,13 @@ final class CameraEngine: NSObject, ObservableObject {
     private func showFlipOverlay() -> Bool {
         guard let buffer = latestPixelBuffer else { return false }
         let ci = CIImage(cvPixelBuffer: buffer)
-        guard let cg = snapshotContext.createCGImage(ci, from: ci.extent) else { return false }
+        // 过渡帧只用来盖住换镜头那一瞬的黑屏，屏幕上根本用不到 4K 原图。
+        // 直接对整帧 createCGImage 会在采集队列上做一次大面积像素拷贝 —— 这一下把采集
+        // 卡住，用户看到的就是"翻转延迟、卡顿"。先把长边缩到 1280 再转图，耗时降到零头。
+        let longEdge = max(ci.extent.width, ci.extent.height)
+        let scale = longEdge > 1280 ? 1280 / longEdge : 1
+        let scaled = scale < 1 ? ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) : ci
+        guard let cg = snapshotContext.createCGImage(scaled, from: scaled.extent) else { return false }
         let image = UIImage(cgImage: cg)
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -1051,11 +1082,44 @@ final class CameraEngine: NSObject, ObservableObject {
                 if device.activeFormat !== matched { device.activeFormat = matched }
             }
 
-            let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
+            // 帧率必须按「当前活动格式真的支持什么」来写。
+            // 把 min/maxFrameDuration 直接设成该格式给不了的值，AVFoundation 会抛
+            // ObjC 异常（NSInvalidArgumentException），而 Swift 的 do/catch 只能接 NSError，
+            // 接不住 ObjC 异常 → 当场闪退。这正是"选 4:3/4K 闪退、翻转闪退"的根因。
+            // 所以这里先夹到格式能给的范围内，再把实际用上的帧率记下来供界面纠偏。
+            let wanted = Double(frameRate.rawValue)
+            let ranges = device.activeFormat.videoSupportedFrameRateRanges
+            let fitting = ranges.filter { $0.minFrameRate <= wanted + 0.01 && wanted <= $0.maxFrameRate + 0.01 }
+            let effective: Double
+            if let range = fitting.min(by: { abs($0.maxFrameRate - wanted) < abs($1.maxFrameRate - wanted) }) {
+                effective = min(max(wanted, range.minFrameRate), range.maxFrameRate)
+            } else if let widest = ranges.max(by: { $0.maxFrameRate < $1.maxFrameRate }) {
+                effective = widest.maxFrameRate          // 这颗格式给不了目标帧率，退到它能给的最高
+            } else {
+                effective = wanted
+            }
+            appliedFPS = Int(effective.rounded())
+            let duration = CMTime(value: 1, timescale: CMTimeScale(effective))
             if device.activeVideoMinFrameDuration != duration { device.activeVideoMinFrameDuration = duration }
             if device.activeVideoMaxFrameDuration != duration { device.activeVideoMaxFrameDuration = duration }
+
+            // 帧率被降了就把选项也纠正过来，免得面板写着 60fps、实际却是 30fps（"不会适应"）
+            syncFrameRateOption()
         } catch {
             Log.write("[会话] 帧率失败 \(error.localizedDescription)")
+        }
+    }
+
+    /// 实际用上的帧率跟选项对不上时，把选项改成实际值并提示。
+    /// 在 sessionQueue 上调用（读 appliedFPS）。
+    private func syncFrameRateOption() {
+        let applied = appliedFPS
+        guard applied > 0, applied != frameRate.rawValue, let matched = FrameRate(rawValue: applied) else { return }
+        Log.write("[会话] 帧率实际为 \(applied)fps，选项已同步")
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.frameRate != matched else { return }
+            self.frameRate = matched
+            self.message("该画质最高支持 \(matched.rawValue)fps，已自动切换")
         }
     }
 
@@ -1203,20 +1267,22 @@ final class CameraEngine: NSObject, ObservableObject {
     /// 采集线程实际送出来的画面尺寸（"4K 到底真不真"的直接证据，显示在分辨率面板里）
     @Published var actualResolution = ""
 
-    func refreshLensAvailability() {
+    func refreshLensAvailability(position: AVCaptureDevice.Position = .back) {
         // 和「视角」列表、实际切镜头同源（都走 ultraWideDevice）：
         // 三处结论必须一致，否则会出现「有 0.5x 档、视角里却没有超广角」这种自相矛盾。
         ultraWideAvailable = ultraWideDevice() != nil
 
-        let back = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        // 分辨率档必须按「当前这颗摄像头」算：前置摄像头给不了 4K / 4:3，
+        // 以前固定按后置算，前置时面板里也照样摆着 4K 4:3 —— 点了没反应、甚至崩。
+        let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
         // 某一档「真的能做」= 设备存在一颗 ≥ 目标尺寸、且宽高比一致的视频格式。
         // 只按尺寸判不行：4:3 的 1440×1080 会被同高的 16:9 1920×1080 蒙混过关；
         // 只按预设判也不行：canSetSessionPreset 为 false 时界面照样显示 4K，
         // 实际录出来还是 1080P —— 就是用户说的"假 4K"。两个条件都要满足才算数。
         func reallySupports(_ quality: VideoQuality) -> Bool {
-            guard let back = back else { return false }
+            guard let device = device else { return false }
             let target = quality.size
-            return back.formats.contains { format in
+            return device.formats.contains { format in
                 let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
                 let w = Int(dims.width), h = Int(dims.height)
                 guard w >= target.width, h >= target.height else { return false }
@@ -1225,9 +1291,21 @@ final class CameraEngine: NSObject, ObservableObject {
         }
         supports4x3 = reallySupports(.p1080x43)
         // 按从高到低的顺序摆，但只保留本机真能给出的档
-        supportedQualities = VideoQuality.allCases.filter { reallySupports($0) }
+        let list = VideoQuality.allCases.filter { reallySupports($0) }
+        supportedQualities = list.isEmpty ? [.p1080, .p720] : list
 
-        Log.write("[镜头] 超广角\(ultraWideAvailable ? "可用" : "不可用") · 4:3\(supports4x3 ? "可用" : "不可用") · 分辨率档 \(supportedQualities.map(\.rawValue).joined(separator: "/"))")
+        Log.write("[镜头] 超广角\(ultraWideAvailable ? "可用" : "不可用") · \(position == .front ? "前置" : "后置") 4:3\(supports4x3 ? "可用" : "不可用") · 分辨率档 \(supportedQualities.map(\.rawValue).joined(separator: "/"))")
+    }
+
+    /// 换到另一颗摄像头后重算可用画质档；当前画质在新摄像头上不可用时自动落到能用的最高档。
+    /// 只在主线程调用（要改 @Published）。
+    private func refreshQualitiesAfterFlip(to position: AVCaptureDevice.Position) {
+        let previous = quality
+        refreshLensAvailability(position: position)
+        guard !availableQualities.contains(previous), let fallback = availableQualities.first else { return }
+        quality = fallback
+        Log.write("[会话] 该摄像头不支持 \(previous.rawValue)，已切到 \(fallback.rawValue)")
+        message("该摄像头不支持 \(previous.rawValue)，已自动切到 \(fallback.rawValue)")
     }
 
     /// 可用的分辨率档：只摆本机真能给出的（假 4K 直接不显示）

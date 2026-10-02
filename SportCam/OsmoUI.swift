@@ -1154,7 +1154,147 @@ private struct DescEditorView: View {
     }
 }
 
-// MARK: - 设置
+// MARK: - 设置（深色卡片式排版）
+
+/// 设置卡片：统一圆角 + 描边 + 分组标题，深色下更克制、专业
+private struct SettingsCard<Content: View>: View {
+    let icon: String
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(Palette.accent)
+                Text(title)
+                    .font(.system(size: 12, weight: .bold))
+                    .tracking(1.2)
+                    .foregroundColor(.white.opacity(0.5))
+            }
+            VStack(alignment: .leading, spacing: 16) { content }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color.white.opacity(0.055)))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Palette.border, lineWidth: 1))
+    }
+}
+
+/// 卡片里的一项：图标 + 标题，下面跟随控件
+private struct SettingRow<Content: View>: View {
+    let icon: String
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.55))
+                    .frame(width: 16)
+                Text(title)
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundColor(.white.opacity(0.85))
+            }
+            content
+        }
+    }
+}
+
+/// 开关行：图标 + 标题（可带副标题）+ 开关
+private struct SettingToggleRow: View {
+    let icon: String
+    let title: String
+    var caption: String? = nil
+    @Binding var isOn: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(isOn ? Palette.accent : .white.opacity(0.5))
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(.white.opacity(0.92))
+                if let caption = caption {
+                    Text(caption)
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.4))
+                }
+            }
+            Spacer(minLength: 8)
+            Toggle("", isOn: $isOn)
+                .labelsHidden()
+                .tint(Palette.accent)
+        }
+    }
+}
+
+/// 胶囊选择器：横向排列的档位，选中态用主题色，比系统 Picker 更紧凑统一
+private struct SettingSegments<T: Hashable>: View {
+    let options: [T]
+    let title: (T) -> String
+    @Binding var selection: T
+    var disabled: Bool = false
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(options, id: \.self) { option in
+                    let selected = option == selection
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) { selection = option }
+                    } label: {
+                        Text(title(option))
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundColor(selected ? .black : .white.opacity(0.8))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(Capsule().fill(selected ? Palette.accent : Color.white.opacity(0.08)))
+                            .overlay(Capsule().stroke(selected ? Color.clear : Palette.border, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .disabled(disabled)
+        .opacity(disabled ? 0.5 : 1)
+    }
+}
+
+/// 深色输入框
+private struct SettingField: View {
+    let placeholder: String
+    @Binding var text: String
+
+    var body: some View {
+        TextField(placeholder, text: $text)
+            .font(.system(size: 13.5))
+            .foregroundColor(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.06)))
+    }
+}
+
+/// 说明文字
+private struct SettingNote: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 11))
+            .foregroundColor(.white.opacity(0.38))
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
 struct SettingsSheet: View {
     @ObservedObject var engine: CameraEngine
     @Environment(\.presentationMode) private var presentation
@@ -1166,110 +1306,157 @@ struct SettingsSheet: View {
 
     var body: some View {
         NavigationView {
-            Form {
-                Section(header: Text("画面")) {
-                    Picker("分辨率", selection: $engine.quality) {
-                        ForEach(engine.availableQualities) { Text($0.rawValue).tag($0) }
-                    }.disabled(engine.isRecording)
-                    Picker("帧率", selection: $engine.frameRate) {
-                        ForEach(FrameRate.allCases) { Text($0.label).tag($0) }
-                    }.disabled(engine.isRecording)
-                    Picker("视角", selection: $engine.fieldOfView) {
-                        ForEach(engine.availableFieldOfViews) { Text($0.rawValue).tag($0) }
-                    }.disabled(engine.isRecording || engine.cameraPosition == .front)
-                    Picker("防抖", selection: $engine.antiShake) {
-                        ForEach(AntiShake.allCases) { Text($0.rawValue).tag($0) }
-                    }.disabled(engine.isRecording)
-                }
-
-                Section(header: Text("拍摄辅助")) {
-                    Toggle("构图网格", isOn: $engine.showGrid)
-                    Toggle("水平仪", isOn: $engine.showLevel)
-                    Toggle("录制提示音", isOn: $engine.beepOn)
-                }
-
-                Section(header: Text("水印"),
-                        footer: Text("水印烧进画面左下角，预览同款显示。需要定位权限，天气需联网；关闭后不定位、不联网、不写入。\n显示哪些内容，在拍摄界面右下角「水印时间」里逐项勾选。")) {
-                    Toggle("时间地点水印", isOn: $engine.watermarkOn)
-                    if engine.watermarkOn {
-                        HStack {
-                            Text("当前地点")
-                            Spacer()
-                            Text(engine.watermarkData.place.isEmpty
-                                 ? (engine.locationNote.isEmpty ? "定位中…" : engine.locationNote)
-                                 : engine.watermarkData.place)
-                                .foregroundColor(.secondary)
-                                .lineLimit(2)
-                                .multilineTextAlignment(.trailing)
+            ZStack {
+                Color(red: 0.055, green: 0.06, blue: 0.075).ignoresSafeArea()
+                ScrollView {
+                    VStack(spacing: 16) {
+                        SettingsCard(icon: "camera.aperture", title: "画面") {
+                            SettingRow(icon: "rectangle.on.rectangle", title: "分辨率") {
+                                SettingSegments(options: engine.availableQualities,
+                                                title: { $0.rawValue },
+                                                selection: $engine.quality,
+                                                disabled: engine.isRecording)
+                            }
+                            SettingRow(icon: "speedometer", title: "帧率") {
+                                SettingSegments(options: FrameRate.allCases,
+                                                title: { "\($0.rawValue)fps" },
+                                                selection: $engine.frameRate,
+                                                disabled: engine.isRecording)
+                            }
+                            if !engine.actualResolution.isEmpty {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "checkmark.seal.fill")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(Palette.accent)
+                                    Text("实际输出 \(engine.actualResolution)")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.white.opacity(0.45))
+                                }
+                            }
+                            SettingRow(icon: "camera.metering.center.weighted", title: "视角") {
+                                SettingSegments(options: engine.availableFieldOfViews,
+                                                title: { $0.rawValue },
+                                                selection: $engine.fieldOfView,
+                                                disabled: engine.isRecording || engine.cameraPosition == .front)
+                            }
+                            SettingRow(icon: "hand.raised.fill", title: "防抖") {
+                                SettingSegments(options: AntiShake.allCases,
+                                                title: { $0.rawValue },
+                                                selection: $engine.antiShake,
+                                                disabled: engine.isRecording)
+                            }
                         }
-                        HStack {
-                            Text("天气数据")
-                            Spacer()
-                            Text(engine.watermarkData.hasWeather ? "已就绪" : "获取中…")
-                                .foregroundColor(.secondary)
+
+                        SettingsCard(icon: "squareshape.split.3x3", title: "拍摄辅助") {
+                            SettingToggleRow(icon: "grid", title: "构图网格", isOn: $engine.showGrid)
+                            SettingToggleRow(icon: "level", title: "水平仪", isOn: $engine.showLevel)
+                            SettingToggleRow(icon: "speaker.wave.2.fill", title: "录制提示音", isOn: $engine.beepOn)
+                        }
+
+                        SettingsCard(icon: "mappin.and.ellipse", title: "水印") {
+                            SettingToggleRow(icon: "text.viewfinder", title: "时间地点水印", isOn: $engine.watermarkOn)
+                            if engine.watermarkOn {
+                                HStack {
+                                    Text("当前地点").font(.system(size: 13)).foregroundColor(.white.opacity(0.7))
+                                    Spacer()
+                                    Text(engine.watermarkData.place.isEmpty
+                                         ? (engine.locationNote.isEmpty ? "定位中…" : engine.locationNote)
+                                         : engine.watermarkData.place)
+                                        .font(.system(size: 13))
+                                        .foregroundColor(.white.opacity(0.45))
+                                        .lineLimit(2)
+                                        .multilineTextAlignment(.trailing)
+                                }
+                                HStack {
+                                    Text("天气数据").font(.system(size: 13)).foregroundColor(.white.opacity(0.7))
+                                    Spacer()
+                                    Text(engine.watermarkData.hasWeather ? "已就绪" : "获取中…")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(.white.opacity(0.45))
+                                }
+                            }
+                            SettingNote(text: "水印烧进画面左下角，预览同款显示。需要定位权限，天气需联网；关闭后不定位、不联网、不写入。显示哪些内容，在拍摄界面右下角「水印时间」里逐项勾选。")
+                        }
+
+                        SettingsCard(icon: "clock.arrow.circlepath", title: "预录") {
+                            SettingToggleRow(icon: "record.circle", title: "开启预录", isOn: $engine.preRecordOn)
+                            SettingRow(icon: "timer", title: "预录时长") {
+                                SettingSegments(options: PreRecordDelay.allCases,
+                                                title: { $0.label },
+                                                selection: $engine.preRecordDelay,
+                                                disabled: !engine.preRecordOn)
+                            }
+                            SettingNote(text: "开启后持续缓存最近画面，按下录像时会把「按下之前」的画面一起保存。")
+                        }
+
+                        SettingsCard(icon: "waveform", title: "语音控制") {
+                            SettingToggleRow(icon: "mic.fill", title: "语音控制", isOn: $engine.voiceOn)
+                            SettingRow(icon: "play.circle", title: "开始口令") {
+                                Text(words.start.joined(separator: " / "))
+                                    .font(.system(size: 12))
+                                    .foregroundColor(Palette.accent)
+                                    .lineLimit(1)
+                                SettingField(placeholder: "自定义开始口令（英文逗号分隔）", text: $startInput)
+                            }
+                            SettingRow(icon: "stop.circle", title: "结束口令") {
+                                Text(words.stop.joined(separator: " / "))
+                                    .font(.system(size: 12))
+                                    .foregroundColor(Palette.accent)
+                                    .lineLimit(1)
+                                SettingField(placeholder: "自定义结束口令（英文逗号分隔）", text: $stopInput)
+                            }
+                            Button {
+                                let start = startInput.isEmpty ? words.start
+                                    : startInput.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                                let stop = stopInput.isEmpty ? words.stop
+                                    : stopInput.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                                words = (start, stop)
+                                engine.setVoiceWords(start: start, stop: stop)
+                            } label: {
+                                Text("保存口令")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundColor(.black)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 9)
+                                    .background(Capsule().fill(Palette.accent))
+                            }
+                            .buttonStyle(.plain)
+                            SettingNote(text: "开启后说「开始录像」即可开始，说「停止录像」即可结束。")
+                        }
+
+                        SettingsCard(icon: "bolt.fill", title: "性能与续航") {
+                            SettingToggleRow(icon: "waveform.badge.mic", title: "降噪", isOn: $engine.denoiseOn)
+                            SettingRow(icon: "moon.zzz.fill", title: "自动熄屏") {
+                                SettingSegments(options: PowerSaveDelay.allCases,
+                                                title: { $0.label },
+                                                selection: $engine.powerSave)
+                            }
+                            SettingNote(text: engine.denoiseOn && !engine.denoiseNote.isEmpty
+                                        ? "降噪已生效：\(engine.denoiseNote)\n熄屏后继续录制，上滑屏幕即可唤醒。"
+                                        : "降噪：抑制麦克风风噪，并在暗光下压制画面噪点（是否可用取决于机型和系统）。熄屏后继续录制，上滑屏幕即可唤醒。")
+                        }
+
+                        SettingsCard(icon: "hand.tap.fill", title: "按键") {
+                            SettingToggleRow(icon: "speaker.wave.3.fill", title: "音量键控制录像", isOn: $engine.volumeKeyRecording)
+                            SettingNote(text: "开启后，按音量键（或 iPhone 16 的相机按钮）即可开始 / 停止录像。默认关闭，想用时再打开。")
+                        }
+
+                        SettingsCard(icon: "eye.fill", title: "显示") {
+                            SettingToggleRow(icon: "internaldrive.fill", title: "显示剩余空间", isOn: $engine.showStorage)
+                            SettingNote(text: "左上角那个「剩余空间 / 可录时长」的胶囊。默认关闭，想看再打开。")
                         }
                     }
-                }
-
-                Section(header: Text("预录"),
-                        footer: Text("开启后持续缓存最近画面，按下录像时会把「按下之前」的画面一起保存。")) {
-                    Toggle("开启预录", isOn: $engine.preRecordOn)
-                    Picker("预录时长", selection: $engine.preRecordDelay) {
-                        ForEach(PreRecordDelay.allCases) { Text($0.label).tag($0) }
-                    }
-                    .disabled(!engine.preRecordOn)
-                }
-
-                Section(header: Text("语音控制"),
-                        footer: Text("开启后说「开始录像」即可开始，说「停止录像」即可结束。")) {
-                    Toggle("语音控制", isOn: $engine.voiceOn)
-                    HStack {
-                        Text("开始口令")
-                        Spacer()
-                        Text(words.start.joined(separator: " / "))
-                            .foregroundColor(.secondary).lineLimit(1)
-                    }
-                    TextField("自定义开始口令（英文逗号分隔）", text: $startInput)
-                    HStack {
-                        Text("结束口令")
-                        Spacer()
-                        Text(words.stop.joined(separator: " / "))
-                            .foregroundColor(.secondary).lineLimit(1)
-                    }
-                    TextField("自定义结束口令（英文逗号分隔）", text: $stopInput)
-                    Button("保存口令") {
-                        let start = startInput.isEmpty ? words.start
-                            : startInput.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-                        let stop = stopInput.isEmpty ? words.stop
-                            : stopInput.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-                        words = (start, stop)
-                        engine.setVoiceWords(start: start, stop: stop)
-                    }
-                }
-
-                Section(header: Text("性能与续航"),
-                        footer: Text(engine.denoiseOn && !engine.denoiseNote.isEmpty
-                                     ? "降噪已生效：\(engine.denoiseNote)\n熄屏后继续录制，上滑屏幕即可唤醒。"
-                                     : "降噪：抑制麦克风风噪，并在暗光下压制画面噪点（是否可用取决于机型和系统）。\n熄屏后继续录制，上滑屏幕即可唤醒。")) {
-                    Toggle("降噪", isOn: $engine.denoiseOn)
-                    Picker("自动熄屏", selection: $engine.powerSave) {
-                        ForEach(PowerSaveDelay.allCases) { Text($0.label).tag($0) }
-                    }
-                }
-
-                Section(header: Text("按键"),
-                        footer: Text("开启后，按音量键（或 iPhone 16 的相机按钮）即可开始 / 停止录像。")) {
-                    Toggle("音量键控制录像", isOn: $engine.volumeKeyRecording)
-                }
-
-                Section(header: Text("显示"),
-                        footer: Text("左上角那个「剩余空间 / 可录时长」的胶囊。默认关闭，想看再打开。")) {
-                    Toggle("显示剩余空间", isOn: $engine.showStorage)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
+                    .padding(.bottom, 34)
                 }
             }
             .navigationBarTitle("设置", displayMode: .inline)
-            .navigationBarItems(trailing: Button("完成") { presentation.wrappedValue.dismiss() })
+            .navigationBarItems(trailing: Button("完成") { presentation.wrappedValue.dismiss() }
+                .fontWeight(.semibold)
+                .foregroundColor(Palette.accent))
         }
+        .preferredColorScheme(.dark)
         .onAppear {
             words = (engine.startWords, engine.stopWords)
             startInput = words.start.joined(separator: ",")
