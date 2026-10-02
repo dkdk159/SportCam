@@ -105,33 +105,6 @@ private struct CircleIcon: View {
     }
 }
 
-/// 右侧的快捷开关（水印 / 省电）：图标 + 文字的小胶囊，打开时变绿，一眼看得出状态
-private struct QuickToggle: View {
-    let icon: String
-    let title: String
-    let active: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(.system(size: 13, weight: .semibold))
-                Text(title)
-                    .font(.system(size: 12, weight: .medium))
-            }
-            .foregroundColor(active ? .black : .white)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .background(active ? Palette.accent : Palette.glass)
-            .clipShape(Capsule())
-            .overlay(Capsule().stroke(active ? Color.clear : Palette.border, lineWidth: 0.5))
-            .animation(.easeOut(duration: 0.18), value: active)
-        }
-        .buttonStyle(PlainButtonStyle())
-    }
-}
-
 /// 焦段档位（0.5x / 1x / 2x）。
 /// 选中状态用动画过渡 —— 直接硬切会"啪"地闪一下，看着像是在重新加载画面。
 private struct ZoomChip: View {
@@ -361,26 +334,6 @@ struct CameraScreen: View {
                 if engine.showLevel {
                     LevelOverlay(sensor: engine.level)
                     Spacer().frame(height: 14)
-                }
-                // 右下方快捷开关：水印 / 省电（参数面板打开时先让位）
-                if engine.proControl == nil {
-                    HStack {
-                        Spacer()
-                        VStack(spacing: 12) {
-                            QuickToggle(icon: "textformat",
-                                        title: "水印",
-                                        active: engine.watermarkOn) {
-                                engine.watermarkOn.toggle()
-                            }
-                            QuickToggle(icon: "moon.fill",
-                                        title: "省电",
-                                        active: engine.powerSave != .never) {
-                                engine.togglePowerSave()
-                            }
-                        }
-                        .padding(.trailing, 20)   // 与底栏圆形按钮右边缘对齐
-                    }
-                    .padding(.bottom, 12)
                 }
                 // 参数面板贴在底栏上方：快门按钮始终露在外面
                 if let control = engine.proControl {
@@ -789,8 +742,13 @@ struct CameraScreen: View {
             // 快门永远钉在屏幕正中央
             shutterButton
 
-            // 右侧：预录时长入口（预录开关在顶部胶囊上点）
+            // 右侧：水印开关 + 预录时长入口（预录开关在顶部胶囊上点）
             HStack(spacing: 14) {
+                CircleIcon(icon: "textformat",
+                           active: engine.watermarkOn,
+                           diameter: 46) {
+                    engine.watermarkOn.toggle()
+                }
                 CircleIcon(icon: "timer", diameter: 46) { showDuration = true }
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
@@ -976,11 +934,12 @@ struct SettingsSheet: View {
                         ForEach(FrameRate.allCases) { Text($0.label).tag($0) }
                     }.disabled(engine.isRecording)
                     Picker("视角", selection: $engine.fieldOfView) {
-                        ForEach(FieldOfView.allCases) { Text($0.rawValue).tag($0) }
+                        ForEach(engine.availableFieldOfViews) { Text($0.rawValue).tag($0) }
                     }.disabled(engine.isRecording || engine.cameraPosition == .front)
                     Picker("防抖", selection: $engine.antiShake) {
                         ForEach(AntiShake.allCases) { Text($0.rawValue).tag($0) }
                     }.disabled(engine.isRecording)
+                    Toggle("显示剩余空间", isOn: $engine.showStorage)
                 }
 
                 Section(header: Text("降噪"),
@@ -1051,7 +1010,6 @@ struct SettingsSheet: View {
                 Section(header: Text("拍摄辅助")) {
                     Toggle("构图网格", isOn: $engine.showGrid)
                     Toggle("水平仪", isOn: $engine.showLevel)
-                    Toggle("显示剩余空间", isOn: $engine.showStorage)
                     Toggle("录制提示音", isOn: $engine.beepOn)
                 }
             }

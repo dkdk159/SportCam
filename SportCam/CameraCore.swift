@@ -408,13 +408,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
     @Published var preRecordOn = false { didSet { if oldValue != preRecordOn { syncPreRecord() } } }
     @Published var preRecordDelay: PreRecordDelay = .s15 { didSet { if oldValue != preRecordDelay { syncPreRecord() } } }
-    @Published var powerSave: PowerSaveDelay = .never {
-        didSet {
-            // 记住上次选过的时间，屏幕上的省电快捷键关掉再打开还是这个值
-            if powerSave != .never { lastPowerSave = powerSave }
-            resetPowerTimer()
-        }
-    }
+    @Published var powerSave: PowerSaveDelay = .never { didSet { resetPowerTimer() } }
     @Published var showGrid = true
     /// 左上角「剩余空间 / 可录时长」显示开关
     @Published var showStorage = true
@@ -469,6 +463,10 @@ final class CameraEngine: NSObject, ObservableObject {
     private var audioInput: AVCaptureDeviceInput?
     /// 换镜头（0.5x ↔ 1x）前先放好目标倍数，switchLens 切完镜头再套用，避免白白回到 1x
     private var pendingZoom: CGFloat = 1.0
+    /// 每台设备上「画质 + 帧率」挑好的格式，选一次就记住。
+    /// 每次都去遍历 device.formats（几十项、每项还要比帧率区间）太慢，那段时间预览是黑的。
+    private let formatCacheLock = NSLock()
+    private var formatCache: [String: AVCaptureDevice.Format] = [:]
     private var deliveredSize = CGSize.zero
     private var needEncoderRebuild = false
     private var lastKeyTime = CMTime.invalid
@@ -497,8 +495,6 @@ final class CameraEngine: NSObject, ObservableObject {
     private var powerTimer: Timer?
     private var uiTimer: Timer?
     private var storageTick = 0
-    /// 省电快捷键用的「上次选过的熄屏时间」
-    private var lastPowerSave: PowerSaveDelay = .s15
 
     // MARK: 启动
     func launch() {
@@ -729,14 +725,17 @@ final class CameraEngine: NSObject, ObservableObject {
                 giveUp("翻转失败，请重试")
                 return
             }
+            // 先把新设备的格式 / 帧率定好，再挂上去：这样"换 input"和"换格式"
+            // 合并成同一次中断。等 commit 之后再改 activeFormat，预览会断开重连，
+            // 用户看到的就是"闪一下"。
+            self.applyFrameRateLocked(on: device)
             self.session.addInput(input)
             self.cameraInput = input
             self.cameraDevice = device
             self.pendingZoom = 1.0
+            self.applyDenoiseLocked()          // 新摄像头的暗光降噪也在配置块里一起生效
             self.session.commitConfiguration()
             self.attachConnectionsLocked()
-            self.applyFrameRateLocked()
-            self.applyDenoiseLocked()          // 新摄像头的暗光降噪也要贴上去
             self.encoder.invalidate()
             self.needEncoderRebuild = true
             // 换了摄像头：分段格式已不一致，旧段全部作废
@@ -784,21 +783,43 @@ final class CameraEngine: NSObject, ObservableObject {
 
     private func applyFrameRateLocked() {
         guard let device = cameraDevice else { return }
+        applyFrameRateLocked(on: device)
+    }
+
+    /// 给指定设备挑格式、设帧率。
+    /// 换摄像头时会带着新设备在 beginConfiguration 块里调用 —— 让"换 input"和"换格式"
+    /// 合并成同一次中断；等 commitConfiguration 之后再动 activeFormat，预览会再黑一下。
+    private func applyFrameRateLocked(on device: AVCaptureDevice) {
         let fps = Double(frameRate.rawValue)
         let target = quality.size
+        let key = "\(device.uniqueID)|\(quality.rawValue)|\(frameRate.rawValue)"
+
+        formatCacheLock.lock()
+        let cached = formatCache[key]
+        formatCacheLock.unlock()
+
         do {
             try device.lockForConfiguration()
-            if let matched = device.formats.first(where: { format in
+            defer { device.unlockForConfiguration() }
+
+            let matched = cached ?? device.formats.first(where: { format in
                 let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
                 guard Int(dims.width) >= target.width, Int(dims.height) >= target.height else { return false }
                 return format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= fps && fps <= $0.maxFrameRate }
-            }) {
-                device.activeFormat = matched
+            })
+            if let matched = matched {
+                if cached == nil {
+                    formatCacheLock.lock()
+                    formatCache[key] = matched
+                    formatCacheLock.unlock()
+                }
+                // 已经就是这个格式就别再赋值：重设一次 activeFormat 预览会再黑一下
+                if device.activeFormat !== matched { device.activeFormat = matched }
             }
+
             let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
-            device.activeVideoMinFrameDuration = duration
-            device.activeVideoMaxFrameDuration = duration
-            device.unlockForConfiguration()
+            if device.activeVideoMinFrameDuration != duration { device.activeVideoMinFrameDuration = duration }
+            if device.activeVideoMaxFrameDuration != duration { device.activeVideoMaxFrameDuration = duration }
         } catch {
             Log.write("[会话] 帧率失败 \(error.localizedDescription)")
         }
@@ -842,12 +863,13 @@ final class CameraEngine: NSObject, ObservableObject {
                 Log.write("[镜头] 切换失败，已还原")
                 return
             }
+            // 先在配置块里把新镜头格式定好再挂上去，避免 commit 之后再改导致二次黑帧
+            self.applyFrameRateLocked(on: device)
             self.session.addInput(input)
             self.cameraInput = input
             self.cameraDevice = device
             self.session.commitConfiguration()
             self.attachConnectionsLocked()
-            self.applyFrameRateLocked()
             self.encoder.invalidate()
             self.needEncoderRebuild = true
             // 换了镜头：分段格式已不一致，旧段全部作废
@@ -947,6 +969,11 @@ final class CameraEngine: NSObject, ObservableObject {
         chips.append("1x")
         chips.append("2x")
         zoomChips = chips
+    }
+
+    /// 本机后置真实存在的镜头。没有超广角/长焦的机型不摆出来，免得选了没反应。
+    var availableFieldOfViews: [FieldOfView] {
+        FieldOfView.allCases.filter { lensDevice($0) != nil }
     }
 
     /// 某档是否处于选中态（前置没有超广角/长焦，统一按广角算）
@@ -1603,11 +1630,6 @@ final class CameraEngine: NSObject, ObservableObject {
     func wakeUp() {
         dimmed = false
         resetPowerTimer()
-    }
-
-    /// 屏幕上的省电快捷键：一键开关自动熄屏（时间沿用上次在设置里选的）
-    func togglePowerSave() {
-        if powerSave == .never { powerSave = lastPowerSave } else { powerSave = .never }
     }
 
     func openPhotos() {
