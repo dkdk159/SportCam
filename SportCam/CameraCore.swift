@@ -74,18 +74,22 @@ enum AntiShake: String, CaseIterable, Identifiable {
 /// 预录时长（按下之前保留多久的画面）
 enum PreRecordDelay: Int, CaseIterable, Identifiable {
     case s5 = 5
+    case s10 = 10
     case s15 = 15
     case s30 = 30
     case m1 = 60
     case m2 = 120
+    case m5 = 300
     var id: Int { rawValue }
     var label: String {
         switch self {
         case .s5: return "5秒"
+        case .s10: return "10秒"
         case .s15: return "15秒"
         case .s30: return "30秒"
         case .m1: return "1分钟"
         case .m2: return "2分钟"
+        case .m5: return "5分钟"
         }
     }
 }
@@ -744,9 +748,9 @@ final class CameraEngine: NSObject, ObservableObject {
         }
         resetPowerTimer()
 
-        recorder.endClip { [weak self] urls in
+        recorder.endClip { [weak self] segments in
             guard let self = self else { return }
-            guard !urls.isEmpty else {
+            guard !segments.isEmpty else {
                 DispatchQueue.main.async {
                     self.isBusy = false
                     self.message("没有录到画面，请重试")
@@ -754,8 +758,8 @@ final class CameraEngine: NSObject, ObservableObject {
                 return
             }
             let output = self.nextClipURL()
-            SegmentMerger.merge(urls, to: output) { ok in
-                for url in urls { try? FileManager.default.removeItem(at: url) }
+            SegmentMerger.merge(segments, to: output) { ok in
+                for seg in segments { try? FileManager.default.removeItem(at: seg.url) }
                 guard ok else {
                     DispatchQueue.main.async {
                         self.isBusy = false
@@ -767,7 +771,7 @@ final class CameraEngine: NSObject, ObservableObject {
                     try? FileManager.default.removeItem(at: output)
                     DispatchQueue.main.async {
                         self.isBusy = false
-                        self.message(saved ? "已保存到相册 · 共\(urls.count)段" : "保存相册失败（检查相册权限）")
+                        self.message(saved ? "已保存到相册 · 共\(segments.count)段" : "保存相册失败（检查相册权限）")
                     }
                 }
             }

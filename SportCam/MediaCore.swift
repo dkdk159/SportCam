@@ -222,6 +222,8 @@ final class SegmentRecorder {
     private struct Segment {
         let url: URL
         let seconds: Double
+        /// 本段第一个视频帧的时间戳（用于按真实先后排序）
+        let start: CMTime
     }
 
     private let queue = DispatchQueue(label: "com.sportcam.segmenter")
@@ -246,7 +248,7 @@ final class SegmentRecorder {
     private var clip: [Segment] = []         // 正式录制期间累计的段
 
     private var pendingFinishes = 0
-    private var endCompletion: (([URL]) -> Void)?
+    private var endCompletion: (([RecordedSegment]) -> Void)?
     private var sequence = 0
     private var lastRejectLog = Date.distantPast
     private var badSegments = 0
@@ -300,8 +302,8 @@ final class SegmentRecorder {
         }
     }
 
-    /// 停止录制：收尾当前段，返回按时间顺序排列的全部分段
-    func endClip(completion: @escaping ([URL]) -> Void) {
+    /// 停止录制：收尾当前段，返回按时间顺序排列的全部分段（含各自在采集时间轴上的起点）
+    func endClip(completion: @escaping ([RecordedSegment]) -> Void) {
         queue.async { [weak self] in
             guard let self = self else { return }
             self.armed = false
@@ -430,6 +432,7 @@ final class SegmentRecorder {
 
     private func finishCurrentSegment(intoClip: Bool, discard: Bool = false) {
         guard let assetWriter = writer, let url = currentURL else { return }
+        let segmentBegin = segmentStart
         let seconds = segmentStart.isValid
             ? max(CMTimeGetSeconds(CMTimeSubtract(lastVideoPTS, segmentStart)), 0)
             : 0
@@ -446,7 +449,7 @@ final class SegmentRecorder {
         lastAudioPTS = .invalid
 
         pendingFinishes += 1
-        let segment = Segment(url: url, seconds: seconds)
+        let segment = Segment(url: url, seconds: seconds, start: segmentBegin)
         let useClip = intoClip
         assetWriter.finishWriting { [weak self] in
             guard let self = self else { return }
@@ -495,37 +498,48 @@ final class SegmentRecorder {
     private func completeEndIfReady() {
         guard let completion = endCompletion, pendingFinishes == 0 else { return }
         endCompletion = nil
-        let urls = clip.map { $0.url }
+        let recorded = clip.map { RecordedSegment(url: $0.url, start: $0.start) }
         clip.removeAll()
         clipMode = false
         notifySegments()
-        Log.write("[录制] 收尾完成 共\(urls.count)段")
-        DispatchQueue.main.async { completion(urls) }
+        Log.write("[录制] 收尾完成 共\(recorded.count)段")
+        DispatchQueue.main.async { completion(recorded) }
     }
 }
 
 // MARK: - 分段合并
-/// 逐样本读取 + 重排时间戳 + 无损写入。
+/// 一段已落盘的录制分段：文件路径 + 它在"采集时间轴"上的起点。
+/// 合并时要靠这个起点把所有分段还原到同一条时间轴，才能做到无缝。
+struct RecordedSegment {
+    let url: URL
+    let start: CMTime
+}
+
+/// 把若干"落盘分段"合成一个完整文件。
 ///
-/// 之前用 AVMutableComposition 按"每段总时长"顺序拼接，段与段之间会差一两帧
-/// （每段的 asset.duration 含不含末帧时长、音频轨比视频轨短一点等），
-/// 接缝处就会停顿或跳帧 —— 看起来"一段一段"的。
-/// 现在改成自己控制输出时间轴：把每段的样本起点对齐到上一段的结束点，
-/// 逐帧重排 PTS 后写入，接缝处零间隙，且只搬样本、不重新编码。
+/// 解决"滋滋声一段一段"的两个根因：
+/// 1) 所有分段出自同一条采集时间轴，每段都记录了自己的起点（RecordedSegment.start）。
+///    合并时统一映射回采集时间轴、再整体平移一次 —— 不做任何"逐段重新对齐"，
+///    段与段之间自然零间隙、零重叠。
+/// 2) 音频不能直接搬 AAC 帧：每个分段都是独立编码的 AAC，各自带编码器的
+///    priming/padding，硬拼会在每个 ~2 秒接缝处爆音（就是听到的"滋滋"）。
+///    这里把各段音频解码成 PCM、拼成一条连续音轨后只编码一次，接缝随之消失。
 enum SegmentMerger {
-    static func merge(_ urls: [URL], to output: URL, completion: @escaping (Bool) -> Void) {
+    static func merge(_ segments: [RecordedSegment], to output: URL, completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            var ok = concat(urls, to: output)
+            var ok = concat(segments, to: output)
             if !ok {
                 Log.write("[合并] 逐帧合并未成功，改用拼接方式重试")
-                ok = fallback(urls, to: output)
+                ok = fallback(segments.map { $0.url }, to: output)
             }
             DispatchQueue.main.async { completion(ok) }
         }
     }
 
-    private static func concat(_ urls: [URL], to output: URL) -> Bool {
-        let valid = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+    private static func concat(_ segments: [RecordedSegment], to output: URL) -> Bool {
+        let valid = segments
+            .filter { FileManager.default.fileExists(atPath: $0.url.path) && $0.start.isValid }
+            .sorted { CMTimeCompare($0.start, $1.start) < 0 }
         guard !valid.isEmpty else {
             Log.write("[合并] 没有可用分段")
             return false
@@ -533,7 +547,7 @@ enum SegmentMerger {
         if valid.count == 1 {
             do {
                 try? FileManager.default.removeItem(at: output)
-                try FileManager.default.copyItem(at: valid[0], to: output)
+                try FileManager.default.copyItem(at: valid[0].url, to: output)
                 Log.write("[合并] 单段，直接使用")
                 return true
             } catch {
@@ -542,23 +556,33 @@ enum SegmentMerger {
             }
         }
 
-        // 从"第一个读得动的段"取视频/音频格式；读不动的直接跳过，不让它拖垮整次合并
+        // 从"第一个读得动的段"取视频格式，并以它的起点作为输出时间轴原点
         var videoFormat: CMFormatDescription?
-        var audioFormat: CMFormatDescription?
-        for url in valid {
-            let probe = AVURLAsset(url: url)
-            if let format = readSamples(probe, media: .video, quiet: true).first
-                .flatMap({ CMSampleBufferGetFormatDescription($0) }) {
+        var audioSrcFormat: CMFormatDescription?
+        var origin = CMTime.zero
+        for seg in valid {
+            let probe = AVURLAsset(url: seg.url)
+            if let head = readSamples(probe, media: .video, quiet: true).first,
+               let format = CMSampleBufferGetFormatDescription(head) {
                 videoFormat = format
-                audioFormat = readSamples(probe, media: .audio, quiet: true).first
-                    .flatMap({ CMSampleBufferGetFormatDescription($0) })
+                origin = seg.start
+                audioSrcFormat = readSamples(probe, media: .audio, quiet: true).first
+                    .flatMap { CMSampleBufferGetFormatDescription($0) }
                 break
             }
-            Log.write("[合并] 跳过读不动的分段 \(url.lastPathComponent)")
+            Log.write("[合并] 跳过读不动的分段 \(seg.url.lastPathComponent)")
         }
-        guard videoFormat != nil else {
+        guard let hint = videoFormat else {
             Log.write("[合并] 所有分段都读不到视频格式")
             return false
+        }
+
+        var audioChannels = 0
+        var audioRate = 0.0
+        if let af = audioSrcFormat,
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(af)?.pointee {
+            audioChannels = Int(asbd.mChannelsPerFrame)
+            audioRate = asbd.mSampleRate
         }
 
         try? FileManager.default.removeItem(at: output)
@@ -566,7 +590,6 @@ enum SegmentMerger {
             Log.write("[合并] 创建写入器失败")
             return false
         }
-        guard let hint = videoFormat else { return false }
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: hint)
         videoInput.expectsMediaDataInRealTime = false
         guard writer.canAdd(videoInput) else {
@@ -576,8 +599,14 @@ enum SegmentMerger {
         writer.add(videoInput)
 
         var audioInput: AVAssetWriterInput?
-        if let audioFormat = audioFormat {
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: audioFormat)
+        if audioChannels > 0, audioRate > 0 {
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVNumberOfChannelsKey: audioChannels,
+                AVSampleRateKey: audioRate,
+                AVEncoderBitRateKey: 128000
+            ]
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
             input.expectsMediaDataInRealTime = false
             if writer.canAdd(input) {
                 writer.add(input)
@@ -592,46 +621,56 @@ enum SegmentMerger {
         writer.startSession(atSourceTime: .zero)
 
         let began = Date()
-        var cursor = CMTime.zero
         var videoCount = 0
         var audioCount = 0
+        var lastVideoOut = CMTime.invalid
+        var lastAudioEnd = CMTime.invalid
 
-        for url in valid {
-            let asset = AVURLAsset(url: url)
+        for seg in valid {
+            let asset = AVURLAsset(url: seg.url)
+            let anchor = seg.start
+
+            // ---- 视频：无损搬运，统一映射回采集时间轴后再整体平移 ----
             let videos = readSamples(asset, media: .video)
-            guard let head = videos.first else { continue }
-            let base = presentationTime(head)
-            let audios = audioInput == nil ? [] : readSamples(asset, media: .audio)
-
-            // 本段时长 = 末帧结束 − 段起点；下一段就从这里接着排，保证零间隙
-            var lastEnd = base
-            for sample in videos {
-                let end = CMTimeAdd(presentationTime(sample), CMSampleBufferGetDuration(sample))
-                if CMTimeCompare(end, lastEnd) > 0 { lastEnd = end }
-            }
-            let limit = CMTimeAdd(cursor, CMTimeSubtract(lastEnd, base))
-
-            var jobs: [(CMTime, Bool, CMSampleBuffer)] = []
-            for sample in videos {
-                let shifted = CMTimeAdd(cursor, CMTimeSubtract(presentationTime(sample), base))
-                if let retimed = retime(sample, to: shifted) { jobs.append((shifted, true, retimed)) }
-            }
-            for sample in audios {
-                let shifted = CMTimeAdd(cursor, CMTimeSubtract(presentationTime(sample), base))
-                // 落在本段窗口外的音频丢掉，避免和相邻段重叠
-                if CMTimeCompare(shifted, cursor) < 0 || CMTimeCompare(shifted, limit) >= 0 { continue }
-                if let retimed = retime(sample, to: shifted) { jobs.append((shifted, false, retimed)) }
-            }
-            jobs.sort { CMTimeCompare($0.0, $1.0) < 0 }
-
-            for (_, isVideo, sample) in jobs {
-                guard let target = isVideo ? videoInput : audioInput else { continue }
-                waitReady(target)
-                if target.append(sample) {
-                    if isVideo { videoCount += 1 } else { audioCount += 1 }
+            if let head = videos.first {
+                let base = presentationTime(head)
+                for sample in videos {
+                    let out = CMTimeSubtract(CMTimeAdd(anchor, CMTimeSubtract(presentationTime(sample), base)), origin)
+                    guard out.isValid, CMTimeCompare(out, .zero) >= 0 else { continue }
+                    if lastVideoOut.isValid && CMTimeCompare(out, lastVideoOut) <= 0 { continue }
+                    guard let retimed = retime(sample, to: out) else { continue }
+                    waitReady(videoInput)
+                    if videoInput.append(retimed) {
+                        lastVideoOut = out
+                        videoCount += 1
+                    }
                 }
             }
-            cursor = limit
+
+            // ---- 音频：解码成 PCM，拼成一条连续音轨（消除接缝爆音）----
+            guard let aIn = audioInput else { continue }
+            let pcm = readAudioPCM(asset)
+            guard let firstPCM = pcm.first else { continue }
+            let abase = presentationTime(firstPCM)
+            for sample in pcm {
+                var out = CMTimeSubtract(CMTimeAdd(anchor, CMTimeSubtract(presentationTime(sample), abase)), origin)
+                guard out.isValid, CMTimeCompare(out, .zero) >= 0 else { continue }
+                if lastAudioEnd.isValid && CMTimeCompare(out, lastAudioEnd) < 0 {
+                    // 段接缝处的亚帧级重叠：直接贴齐到上一帧结尾，既不丢音频也不重叠
+                    let overlap = CMTimeGetSeconds(CMTimeSubtract(lastAudioEnd, out))
+                    if overlap <= 0.05 {
+                        out = lastAudioEnd
+                    } else {
+                        continue
+                    }
+                }
+                guard let retimed = retime(sample, to: out) else { continue }
+                waitReady(aIn)
+                if aIn.append(retimed) {
+                    lastAudioEnd = CMTimeAdd(out, CMSampleBufferGetDuration(sample))
+                    audioCount += 1
+                }
+            }
         }
 
         guard videoCount > 0 else {
@@ -649,7 +688,7 @@ enum SegmentMerger {
         let ok = writer.status == .completed
         let usedMS = Int(Date().timeIntervalSince(began) * 1000)
         if ok {
-            let seconds = String(format: "%.1f", CMTimeGetSeconds(cursor))
+            let seconds = String(format: "%.1f", CMTimeGetSeconds(lastVideoOut))
             Log.write("[合并] 成功 \(valid.count)段 v=\(videoCount) a=\(audioCount) 时长\(seconds)秒 用时\(usedMS)ms")
         } else {
             Log.write("[合并] 失败 status=\(writer.status.rawValue) \(writer.error?.localizedDescription ?? "")")
@@ -733,6 +772,29 @@ enum SegmentMerger {
         if samples.isEmpty && !quiet {
             Log.write("[合并] 该段读不到样本 status=\(reader.status.rawValue) \(reader.error?.localizedDescription ?? "")")
         }
+        reader.cancelReading()
+        return samples
+    }
+
+    /// 把一段的音频解码成 PCM 样本（未压缩），用于拼成一条连续音轨后只编码一次。
+    /// 直接搬 AAC 帧会把每段各自的编码器 priming/padding 也带进来 → 接缝爆音。
+    private static func readAudioPCM(_ asset: AVURLAsset) -> [CMSampleBuffer] {
+        guard let track = asset.tracks(withMediaType: .audio).first else { return [] }
+        guard let reader = try? AVAssetReader(asset: asset) else { return [] }
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+        output.alwaysCopiesSampleData = true
+        guard reader.canAdd(output) else { return [] }
+        reader.add(output)
+        guard reader.startReading() else { return [] }
+        var samples: [CMSampleBuffer] = []
+        while let sample = output.copyNextSampleBuffer() { samples.append(sample) }
         reader.cancelReading()
         return samples
     }
