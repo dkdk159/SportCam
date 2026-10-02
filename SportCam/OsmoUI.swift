@@ -105,6 +105,28 @@ private struct CircleIcon: View {
     }
 }
 
+/// 焦段档位（0.5x / 1x / 2x）。
+/// 选中状态用动画过渡 —— 直接硬切会"啪"地闪一下，看着像是在重新加载画面。
+private struct ZoomChip: View {
+    let label: String
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(selected ? .black : .white)
+                .frame(width: 34, height: 34)
+                .background(selected ? Color.white : Color.clear)
+                .clipShape(Circle())
+                .scaleEffect(selected ? 1.0 : 0.94)
+                .animation(.easeOut(duration: 0.18), value: selected)
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+}
+
 /// 预览上的水印：只是位置示意，真正烧进视频的那一份在导出时绘制。
 /// 只有设置里打开「时间地点水印」才出现在画面上。
 private struct WatermarkPreview: View {
@@ -158,27 +180,47 @@ private struct GridOverlay: View {
     }
 }
 
+/// 水平尺：一段固定基准线 + 一条随倾角转动的指示线，上方带角度读数。
+/// 两条线重合成一条直线就是水平（此时整条尺变绿），和相机/摄像机上的一样。
 private struct LevelOverlay: View {
     @ObservedObject var sensor: LevelSensor
 
+    /// roll 是弧度，水平尺上显示成角度更直观
+    private var degrees: Double { sensor.roll * 180 / .pi }
+
     var body: some View {
-        ZStack {
-            Circle()
-                .stroke(sensor.level ? Palette.accent : Palette.appleYellow, lineWidth: 1.5)
-                .frame(width: 54, height: 54)
-            Rectangle()
-                .fill(sensor.level ? Palette.accent : Palette.appleYellow)
-                .frame(width: 34, height: 1)
-                .offset(x: CGFloat(sensor.roll * 100))
-            Rectangle()
-                .fill(sensor.level ? Palette.accent : Palette.appleYellow)
-                .frame(width: 1, height: 34)
-                .offset(y: CGFloat(sensor.pitch * 100))
-            Circle()
-                .fill(sensor.level ? Palette.accent : Palette.appleYellow)
-                .frame(width: 5, height: 5)
+        let leveled = sensor.level
+        let tint = leveled ? Palette.accent : Color.white.opacity(0.92)
+
+        return VStack(spacing: 6) {
+            Text(String(format: "%+.1f°", degrees))
+                .font(Palette.mono(10, .semibold))
+                .foregroundColor(leveled ? Palette.accent : .white.opacity(0.65))
+
+            ZStack {
+                // 左右两段固定基准线，中间留出位置给指示线
+                HStack(spacing: 16) {
+                    Capsule().fill(Color.white.opacity(0.5)).frame(width: 56, height: 1.5)
+                    Capsule().fill(Color.white.opacity(0.5)).frame(width: 56, height: 1.5)
+                }
+                // 指示线：跟着手机倾斜转，和基准线对齐即水平
+                Capsule()
+                    .fill(tint)
+                    .frame(width: 46, height: 2)
+                    .rotationEffect(.radians(sensor.roll))
+                    .shadow(color: leveled ? Palette.accent.opacity(0.9) : .clear, radius: 4)
+                    .animation(.linear(duration: 0.08), value: sensor.roll)
+            }
+            .frame(width: 150, height: 30)
         }
-        .opacity(0.85)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .background(Color.black.opacity(0.30))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
     }
 }
 
@@ -486,10 +528,12 @@ struct CameraScreen: View {
                             .foregroundColor(.white)
                     }
                     VStack(alignment: .leading, spacing: 0) {
-                        Text(engine.preRecordOn ? timeText(engine.preRecordSeconds) : "--:--")
+                        // 没开预录时只显示设置好的时长（时长在右下角计时器按钮里改）
+                        Text(engine.preRecordOn ? timeText(engine.preRecordSeconds)
+                                                : engine.preRecordDelay.label)
                             .font(Palette.mono(15, .bold))
                             .foregroundColor(.white)
-                        Text(engine.preRecordOn ? "预录制中" : "未开预录")
+                        Text(engine.preRecordOn ? "预录制中" : "预录时长")
                             .font(.system(size: 11))
                             .foregroundColor(.white.opacity(0.92))
                     }
@@ -580,17 +624,9 @@ struct CameraScreen: View {
     private var zoomPill: some View {
         HStack(spacing: 4) {
             ForEach(["0.5x", "1x", "2x"], id: \.self) { chip in
-                Button {
+                ZoomChip(label: chip, selected: zoomSelected(chip)) {
                     engine.selectZoomChip(chip)
-                } label: {
-                    Text(chip)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(zoomSelected(chip) ? .black : .white)
-                        .frame(width: 34, height: 34)
-                        .background(zoomSelected(chip) ? Color.white : Color.clear)
-                        .clipShape(Circle())
                 }
-                .buttonStyle(PlainButtonStyle())
                 .disabled(engine.isRecording)
             }
         }
@@ -600,55 +636,65 @@ struct CameraScreen: View {
     }
 
     private var shutterRow: some View {
-        HStack(spacing: 14) {
-            // 一行都是同样大小的圆形图标按钮：和顶栏保持一致，也更像系统相机
-            CircleIcon(icon: "photo.on.rectangle", diameter: 46) {
-                engine.openPhotos()
-            }
-
-            // 一个按钮管全部专业参数：点开面板，里面几项随便切
-            Button {
-                setPro(engine.proControl == nil ? .exposure : nil)
-            } label: {
-                Image(systemName: "slider.horizontal.3")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(engine.proControl != nil ? .black : .white)
-                    .frame(width: 46, height: 46)
-                    .background(engine.proControl != nil ? Color.white : Palette.glass)
-                    .clipShape(Circle())
-                    .overlay(Circle().stroke(Palette.border, lineWidth: 0.5))
-            }
-            .buttonStyle(PlainButtonStyle())
-
-            Spacer()
-
-            Button {
-                if engine.isRecording { engine.stopRecording() } else { engine.startRecording() }
-            } label: {
-                ZStack {
-                    Circle().stroke(Color.white, lineWidth: 4).frame(width: 78, height: 78)
-                    if engine.isBusy {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: Palette.appleYellow))
-                            .scaleEffect(1.4)
-                    } else if engine.isRecording {
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(Palette.record)
-                            .frame(width: 34, height: 34)
-                    } else {
-                        Circle().fill(Palette.record).frame(width: 63, height: 63)
-                    }
+        HStack(spacing: 0) {
+            // 左侧：相册 + 专业参数
+            HStack(spacing: 14) {
+                CircleIcon(icon: "photo.on.rectangle", diameter: 46) {
+                    engine.openPhotos()
                 }
+                proToggleButton
             }
-            .buttonStyle(PlainButtonStyle())
-            .disabled(engine.isBusy)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Spacer()
+            // 快门永远钉在屏幕正中央
+            shutterButton
 
-            // 预录时长入口：点一下就能改（预录开关在顶部胶囊上点）
-            CircleIcon(icon: "timer", diameter: 46) { showDuration = true }
+            // 右侧：预录时长入口（预录开关在顶部胶囊上点）
+            HStack(spacing: 14) {
+                CircleIcon(icon: "timer", diameter: 46) { showDuration = true }
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(.horizontal, 20)
+    }
+
+    /// 一个按钮管全部专业参数：点开面板，里面六项随便切
+    private var proToggleButton: some View {
+        Button {
+            setPro(engine.proControl == nil ? .exposure : nil)
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundColor(engine.proControl != nil ? .black : .white)
+                .frame(width: 46, height: 46)
+                .background(engine.proControl != nil ? Color.white : Palette.glass)
+                .clipShape(Circle())
+                .overlay(Circle().stroke(Palette.border, lineWidth: 0.5))
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+
+    private var shutterButton: some View {
+        Button {
+            if engine.isRecording { engine.stopRecording() } else { engine.startRecording() }
+        } label: {
+            ZStack {
+                Circle().stroke(Color.white, lineWidth: 4).frame(width: 78, height: 78)
+                if engine.isBusy {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: Palette.appleYellow))
+                        .scaleEffect(1.4)
+                } else if engine.isRecording {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Palette.record)
+                        .frame(width: 34, height: 34)
+                } else {
+                    Circle().fill(Palette.record).frame(width: 63, height: 63)
+                }
+            }
+        }
+        .buttonStyle(PlainButtonStyle())
+        .disabled(engine.isBusy)
     }
 
     // MARK: 专业参数面板（贴在底栏上方，六项在这里直接切换）

@@ -459,6 +459,8 @@ final class CameraEngine: NSObject, ObservableObject {
     }
     private var cameraInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
+    /// 换镜头（0.5x ↔ 1x）前先放好目标倍数，switchLens 切完镜头再套用，避免白白回到 1x
+    private var pendingZoom: CGFloat = 1.0
     private var deliveredSize = CGSize.zero
     private var needEncoderRebuild = false
     private var lastKeyTime = CMTime.invalid
@@ -647,6 +649,12 @@ final class CameraEngine: NSObject, ObservableObject {
             ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
     }
 
+    /// 严格按镜头类型取设备：本机没有这颗镜头（比如 iPhone 8 Plus 没有超广角）就返回 nil，
+    /// 用来在切焦段之前判断"到底需不需要动会话"。
+    private func lensDevice(_ fov: FieldOfView) -> AVCaptureDevice? {
+        AVCaptureDevice.default(fov.lens, for: .video, position: .back)
+    }
+
     /// 前后摄像头翻转
     func toggleCamera() {
         sessionQueue.async { [weak self] in
@@ -743,6 +751,10 @@ final class CameraEngine: NSObject, ObservableObject {
     func switchLens() {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
+            // selectZoomChip 会提前放好目标倍数（比如点 2x 切回广角后仍要停在 2x）
+            let restoreZoom = self.pendingZoom
+            self.pendingZoom = 1.0
+
             if self.recording {
                 Log.write("[镜头] 录制中不可切换")
                 return
@@ -751,17 +763,30 @@ final class CameraEngine: NSObject, ObservableObject {
                 Log.write("[镜头] 前置摄像头不支持切换焦段")
                 return
             }
-            guard let device = self.camera(.back, fieldOfView: self.fieldOfView),
-                  let input = try? AVCaptureDeviceInput(device: device) else { return }
-            self.session.beginConfiguration()
-            if let old = self.cameraInput { self.session.removeInput(old) }
-            if self.session.canAddInput(input) {
-                self.session.addInput(input)
-                self.cameraInput = input
-                self.cameraDevice = device
-            } else if let old = self.cameraInput {
-                self.session.addInput(old)
+            guard let device = self.camera(.back, fieldOfView: self.fieldOfView) else { return }
+
+            // 已经就是同一颗镜头（本机没有超广角时 0.5x 会回退到广角）：
+            // 只改倍数就行。以前这里会把同一颗摄像头 removeInput + addInput 重来一遍，
+            // 画面必然黑一下 —— 这就是"点 0.5x 会闪"的原因。
+            if let current = self.cameraDevice, current.uniqueID == device.uniqueID {
+                DispatchQueue.main.async { self.zoom = restoreZoom }
+                Log.write("[镜头] \(self.fieldOfView.rawValue)（同镜头，仅改变焦倍数）")
+                return
             }
+
+            guard let input = try? AVCaptureDeviceInput(device: device) else { return }
+            let old = self.cameraInput
+            self.session.beginConfiguration()
+            if let old = old { self.session.removeInput(old) }
+            guard self.session.canAddInput(input) else {
+                if let old = old { self.session.addInput(old) }
+                self.session.commitConfiguration()
+                Log.write("[镜头] 切换失败，已还原")
+                return
+            }
+            self.session.addInput(input)
+            self.cameraInput = input
+            self.cameraDevice = device
             self.session.commitConfiguration()
             self.attachConnectionsLocked()
             self.applyFrameRateLocked()
@@ -771,7 +796,7 @@ final class CameraEngine: NSObject, ObservableObject {
             self.recorder.reset()
             self.rearmPreRecord()
             DispatchQueue.main.async {
-                self.zoom = 1.0
+                self.zoom = restoreZoom
                 self.exposureBias = 0
                 self.isoValue = 0
                 self.shutterSeconds = 0
@@ -810,32 +835,46 @@ final class CameraEngine: NSObject, ObservableObject {
             defer { device.unlockForConfiguration() }
             let maxFactor = min(device.activeFormat.videoMaxZoomFactor, 8.0)
             let target = max(1.0, min(zoom, maxFactor))
-            if device.isRampingVideoZoom { device.cancelVideoZoomRamp() }
             let distance = abs(target - device.videoZoomFactor)
+            // 上一次的斜坡还没跑完就再点：先取消，否则两次斜坡叠在一起会忽快忽慢
+            if device.isRampingVideoZoom { device.cancelVideoZoomRamp() }
             if distance < 0.01 {
                 device.videoZoomFactor = target
-            } else {
-                // 直接赋值会让系统在 2x 附近反复切镜头、重新对焦，手感一顿一顿的。
-                // 用 0.15 秒跑完的小斜坡，既跟手又不触发镜头震荡。
-                device.ramp(toVideoZoomFactor: target, withRate: Float(max(distance / 0.15, 5)))
+                return
             }
+            // 固定时长的小斜坡：既跟手，又不会在 2x 附近触发系统反复换镜头 + 重新对焦
+            device.ramp(toVideoZoomFactor: target, withRate: Float(max(distance / 0.28, 3)))
         } catch {
             Log.write("[变焦] 失败 \(error.localizedDescription)")
         }
     }
 
-    /// 0.5x / 1x / 2x 三档
+    /// 0.5x / 1x / 2x 三档。
+    /// 核心原则：能不复建会话就绝不复建 —— 同一颗镜头内只改 videoZoomFactor（平滑过渡，无黑帧），
+    /// 只有真的需要换镜头（0.5x 的超广角）时才换 input。
     func selectZoomChip(_ chip: String) {
+        let fov: FieldOfView
+        let factor: CGFloat
         switch chip {
-        case "0.5x":
-            if fieldOfView != .ultraWide { fieldOfView = .ultraWide }
-            zoom = 1.0
-        case "1x":
-            if fieldOfView != .wide { fieldOfView = .wide }
-            zoom = 1.0
-        default:
-            if fieldOfView != .wide { fieldOfView = .wide }
-            zoom = 2.0
+        case "0.5x": fov = .ultraWide; factor = 1.0
+        case "2x":   fov = .wide;      factor = 2.0
+        default:     fov = .wide;      factor = 1.0
+        }
+
+        // 前置摄像头、或本机根本没有这颗镜头（如 iPhone 8 Plus 没有超广角）：
+        // 只在当前镜头上改倍数，不动会话。
+        guard cameraPosition == .back, lensDevice(fov) != nil else {
+            zoom = factor
+            return
+        }
+
+        if fieldOfView == fov {
+            // 1x ↔ 2x 都在广角这颗镜头上：直接斜坡过去，中间没有任何黑帧
+            zoom = factor
+        } else {
+            // 真要换镜头：先把目标倍数放好，切完镜头由 switchLens 套用
+            pendingZoom = factor
+            fieldOfView = fov
         }
     }
 
