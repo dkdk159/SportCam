@@ -1230,7 +1230,7 @@ private struct SettingToggleRow: View {
             Spacer(minLength: 8)
             Toggle("", isOn: $isOn)
                 .labelsHidden()
-                .tint(Palette.accent)
+                .accentColor(Palette.accent)
         }
     }
 }
@@ -1453,7 +1453,7 @@ struct SettingsSheet: View {
             }
             .navigationBarTitle("设置", displayMode: .inline)
             .navigationBarItems(trailing: Button("完成") { presentation.wrappedValue.dismiss() }
-                .fontWeight(.semibold)
+                .font(.system(size: 15, weight: .semibold))
                 .foregroundColor(Palette.accent))
         }
         .preferredColorScheme(.dark)
