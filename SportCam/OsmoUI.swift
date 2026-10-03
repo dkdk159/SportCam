@@ -202,7 +202,7 @@ final class ThemeStore: ObservableObject {
             },
             set: { newColor in
                 var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-                _ = UIColor(newColor).getRed(&r, &g, &b, &a)
+                _ = UIColor(newColor).getRed(&r, green: &g, blue: &b, alpha: &a)
                 self.customBase = (Double(r), Double(g), Double(b))
             }
         )
