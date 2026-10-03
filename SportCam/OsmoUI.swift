@@ -1812,8 +1812,26 @@ struct SettingsSheet: View {
                                     .font(Palette.mono(15, .semibold))
                                     .foregroundColor(Palette.accent)
                             }
-                            SettingNote(text: L("关注抖音账号获取最新版本与使用教程；使用中遇到问题可联系 QQ 客服。",
-                                                "Follow our Douyin for the latest version and tutorials; contact QQ support if you run into problems."))
+                            SettingRow(icon: "hand.raised.fill", title: L("隐私政策", "Privacy Policy")) {
+                                Button {
+                                    if let url = URL(string: "https://aiyulu.xyz/privacy.html") {
+                                        UIApplication.shared.open(url, options: [:], completionHandler: nil)
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Text(L("查看完整隐私政策", "View Full Privacy Policy"))
+                                            .font(.system(size: 13.5, weight: .semibold))
+                                            .foregroundColor(Palette.accent)
+                                        Image(systemName: "chevron.right")
+                                            .font(.system(size: 11, weight: .semibold))
+                                            .foregroundColor(Palette.accent.opacity(0.7))
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(PlainButtonStyle())
+                            }
+                            SettingNote(text: L("关注抖音账号获取最新版本与使用教程；使用中遇到问题可联系 QQ 客服；点击查看完整隐私政策。",
+                                                "Follow our Douyin for the latest version and tutorials; contact QQ support if you run into problems; tap to view the full privacy policy."))
                         }
 
                         // 语言：底部切换，选中即生效并记忆
