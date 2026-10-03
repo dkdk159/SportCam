@@ -547,6 +547,15 @@ final class CameraEngine: NSObject, ObservableObject {
     }
     /// 水印数据：地点 / 海拔 / 天气…，定位和天气各填一半，谁先回来谁先显示
     @Published var watermarkData = WatermarkData() { didSet { refreshBurnSnapshot() } }
+    /// 水印字体（系统/圆体/衬线/等宽）：预览和烧进视频的用同一套
+    @Published var watermarkFont: WatermarkFont = .system {
+        didSet {
+            if oldValue != watermarkFont {
+                saveWatermarkSettings()
+                refreshBurnSnapshot()
+            }
+        }
+    }
     /// 定位异常提示（只在设置页显示，不会写进视频）
     @Published var locationNote = ""
     /// 用户是否主动碰过水印（开过面板 / 勾过项）。启动预热不要在这种时候把定位停掉
@@ -639,6 +648,7 @@ final class CameraEngine: NSObject, ObservableObject {
     private var burnOn = false
     private var burnItems: Set<WatermarkItem> = []
     private var burnData = WatermarkData()
+    private var burnFont: WatermarkFont = .system
     /// 本次录制是否真的把水印烧进了画面：合并时据此决定还要不要再叠一次
     private var clipBurnedWatermark = false
 
@@ -648,6 +658,7 @@ final class CameraEngine: NSObject, ObservableObject {
         burnOn = watermarkOn
         burnItems = watermarkItems
         burnData = watermarkData
+        burnFont = watermarkFont
         burnLock.unlock()
     }
 
@@ -1880,18 +1891,28 @@ final class CameraEngine: NSObject, ObservableObject {
 
     private static let itemsKey = "sportcam.watermark.items"
     private static let descKey = "sportcam.watermark.desc"
+    private static let fontKey = "sportcam.watermark.font"
 
     private func saveWatermarkSettings() {
         UserDefaults.standard.set(watermarkItems.map { $0.rawValue }, forKey: CameraEngine.itemsKey)
+        UserDefaults.standard.set(watermarkFont.rawValue, forKey: CameraEngine.fontKey)
     }
 
     private func loadWatermarkSettings() {
         let store = UserDefaults.standard
-        if let raw = store.array(forKey: CameraEngine.itemsKey) as? [String] {
+        // 先把存档都取到本地再赋值：赋值会触发 didSet 回写，若边读边写会互相覆盖
+        let rawItems = store.array(forKey: CameraEngine.itemsKey) as? [String]
+        let rawFont = store.string(forKey: CameraEngine.fontKey)
+        let savedDesc = store.string(forKey: CameraEngine.descKey)
+
+        if let rawFont = rawFont, let font = WatermarkFont(rawValue: rawFont) {
+            watermarkFont = font
+        }
+        if let raw = rawItems {
             watermarkItems = Set(raw.compactMap { WatermarkItem(rawValue: $0) })
         }
         var data = watermarkData
-        if let text = store.string(forKey: CameraEngine.descKey), !text.isEmpty {
+        if let text = savedDesc, !text.isEmpty {
             data.desc = text
         }
         watermarkData = data
@@ -1967,6 +1988,7 @@ final class CameraEngine: NSObject, ObservableObject {
             let mark: WatermarkConfig? = (self.watermarkOn && !self.clipBurnedWatermark) ? WatermarkConfig(
                 data: self.watermarkData,
                 items: self.watermarkItems,
+                font: self.watermarkFont,
                 startDate: clip.segments.map { $0.createdAt }.min() ?? Date()
             ) : nil
             SegmentMerger.merge(clip, to: output, watermark: mark) { ok in
@@ -2309,8 +2331,9 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
         let burning = burnOn
         let items = burnItems
         let data = burnData
+        let font = burnFont
         burnLock.unlock()
-        if burning, let burned = burnFrame(pixelBuffer, size: size, items: items, data: data) {
+        if burning, let burned = burnFrame(pixelBuffer, size: size, items: items, data: data, font: font) {
             frame = burned
         }
         encoder.encode(frame, at: time, forceKey: forceKey)
@@ -2319,13 +2342,14 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
     /// 把水印合成到一帧上（走 Core Image / GPU，1080p 每帧几毫秒）。
     /// 目标 buffer 从池里取 —— 逐帧新分配会让内存一路涨，录久了直接被系统杀掉。
     private func burnFrame(_ source: CVPixelBuffer, size: CGSize,
-                           items: Set<WatermarkItem>, data: WatermarkData) -> CVPixelBuffer? {
+                           items: Set<WatermarkItem>, data: WatermarkData,
+                           font: WatermarkFont) -> CVPixelBuffer? {
         if burnRenderer == nil || burnRendererSize != size {
             burnRenderer = WatermarkRenderer(renderSize: size)
             burnRendererSize = size
         }
         guard let renderer = burnRenderer,
-              let overlay = renderer.overlay(for: Date(), data: data, items: items) else { return nil }
+              let overlay = renderer.overlay(for: Date(), data: data, items: items, font: font) else { return nil }
 
         // 目标用 BGRA：Core Image 对它支持最稳，编码器内部再转回 YUV
         if burnPool == nil || burnPoolSize != size {

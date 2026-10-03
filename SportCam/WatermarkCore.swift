@@ -42,6 +42,44 @@ enum WatermarkItem: String, CaseIterable, Identifiable {
     static let `default`: Set<WatermarkItem> = [.time, .place]
 }
 
+// MARK: - 水印字体
+/// 水印可选字体。都是 iOS 自带字形，不额外打包字体文件。
+/// 预览（SwiftUI）和烧录（UIKit）按同一套字形取字，保证"屏幕看到的 = 录进去的"。
+enum WatermarkFont: String, CaseIterable, Identifiable {
+    case system = "system"
+    case rounded = "rounded"
+    case serif = "serif"
+    case monospaced = "monospaced"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system:     return L("系统", "System")
+        case .rounded:    return L("圆体", "Rounded")
+        case .serif:      return L("衬线", "Serif")
+        case .monospaced: return L("等宽", "Mono")
+        }
+    }
+
+    /// 字形（.system 就是系统默认字形）
+    var design: UIFontDescriptor.SystemDesign {
+        switch self {
+        case .system:     return .default
+        case .rounded:    return .rounded
+        case .serif:      return .serif
+        case .monospaced: return .monospaced
+        }
+    }
+
+    /// 烧录用：UIKit 字体。系统取不到对应字形时退回默认字体，不会崩
+    func uiFont(size: CGFloat, weight: UIFont.Weight = .semibold) -> UIFont {
+        let base = UIFont.systemFont(ofSize: size, weight: weight)
+        guard let desc = base.fontDescriptor.withDesign(design) else { return base }
+        return UIFont(descriptor: desc, size: size)
+    }
+}
+
 // MARK: - 水印数据
 /// 水印要用的实时数据。定位和天气各填一半，谁先回来谁先显示，互不阻塞。
 struct WatermarkData {
@@ -60,6 +98,8 @@ struct WatermarkData {
 struct WatermarkConfig {
     let data: WatermarkData
     let items: Set<WatermarkItem>
+    /// 水印字体（预览与烧录取同一套字形）
+    let font: WatermarkFont
     /// 视频第 0 秒对应的真实时间（第一段开始写盘的那一刻）
     let startDate: Date
 }
@@ -439,18 +479,20 @@ final class WatermarkRenderer {
         size = renderSize
     }
 
-    func overlay(for date: Date, data: WatermarkData, items: Set<WatermarkItem>) -> CIImage? {
+    func overlay(for date: Date, data: WatermarkData, items: Set<WatermarkItem>,
+                 font: WatermarkFont) -> CIImage? {
         let lines = WatermarkComposer.lines(date: date, data: data, items: items)
         guard !lines.isEmpty else { return nil }
 
-        // 秒 + 内容一起做 key：时间在走、天气刚回来，都会自动重画
-        let key = String(Int(date.timeIntervalSince1970.rounded(.down))) + "|" + lines.joined(separator: "\u{1}")
+        // 秒 + 字体 + 内容一起做 key：时间在走、天气刚回来、换了字体，都会自动重画
+        let key = String(Int(date.timeIntervalSince1970.rounded(.down))) + "|" + font.rawValue
+            + "|" + lines.joined(separator: "\u{1}")
 
         lock.lock()
         if let hit = cache[key] { lock.unlock(); return hit }
         lock.unlock()
 
-        guard let image = render(lines: lines), let ci = CIImage(image: image) else { return nil }
+        guard let image = render(lines: lines, font: font), let ci = CIImage(image: image) else { return nil }
 
         lock.lock()
         cache[key] = ci
@@ -462,7 +504,7 @@ final class WatermarkRenderer {
         return ci
     }
 
-    private func render(lines: [String]) -> UIImage? {
+    private func render(lines: [String], font: WatermarkFont) -> UIImage? {
         guard size.width > 8, size.height > 8 else { return nil }
 
         // 字号对齐参考 App：按画面高度取 1.75%（原来 2.4% 偏大，整块显得笨重）
@@ -490,7 +532,7 @@ final class WatermarkRenderer {
             shadow.shadowOffset = CGSize(width: 0, height: fontSize * 0.05)
 
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: fontSize, weight: .semibold),
+                .font: font.uiFont(size: fontSize, weight: .semibold),
                 .foregroundColor: UIColor.white,
                 .strokeColor: UIColor.black.withAlphaComponent(0.5),
                 .strokeWidth: -3.0,
@@ -540,7 +582,8 @@ enum WatermarkComposition {
             let date = config.startDate.addingTimeInterval(seconds.isFinite ? max(seconds, 0) : 0)
             let source = request.sourceImage
 
-            guard let overlay = drawer.overlay(for: date, data: config.data, items: config.items) else {
+            guard let overlay = drawer.overlay(for: date, data: config.data, items: config.items,
+                                               font: config.font) else {
                 request.finish(with: source, context: nil)
                 return
             }

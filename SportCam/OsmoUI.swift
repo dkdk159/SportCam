@@ -38,8 +38,54 @@ func L(_ zh: String, _ en: String) -> String {
     Lang.shared.current == .en ? en : zh
 }
 
+// MARK: - 主题配色（多套主色，设置里一键切换；默认青绿，选择记忆）
+enum AppTheme: String, CaseIterable, Identifiable {
+    case mint = "mint"
+    case amber = "amber"
+    case sky = "sky"
+    case violet = "violet"
+
+    var id: String { rawValue }
+
+    /// 档位名（中英两套都写出来，跟着语言走）
+    var label: String {
+        switch self {
+        case .mint:   return L("青绿", "Mint")
+        case .amber:  return L("琥珀", "Amber")
+        case .sky:    return L("天蓝", "Sky")
+        case .violet: return L("紫罗兰", "Violet")
+        }
+    }
+
+    /// 主色。按钮选中态 / 开关 / 卡片标题图标都取它，切一套整个界面就换色
+    var accent: Color {
+        switch self {
+        case .mint:   return Color(red: 0.20, green: 0.86, blue: 0.70)
+        case .amber:  return Color(red: 1.00, green: 0.62, blue: 0.20)
+        case .sky:    return Color(red: 0.26, green: 0.62, blue: 1.00)
+        case .violet: return Color(red: 0.69, green: 0.50, blue: 1.00)
+        }
+    }
+}
+
+/// 当前主题。改它会立刻让主界面 / 设置页重绘（两个视图都监听它）。
+final class ThemeStore: ObservableObject {
+    static let shared = ThemeStore()
+    private static let key = "app_theme"
+
+    @Published var current: AppTheme {
+        didSet { UserDefaults.standard.set(current.rawValue, forKey: Self.key) }
+    }
+
+    private init() {
+        let saved = UserDefaults.standard.string(forKey: Self.key) ?? ""
+        current = AppTheme(rawValue: saved) ?? .mint
+    }
+}
+
 private enum Palette {
-    static let accent = Color(red: 0.20, green: 0.86, blue: 0.70)
+    /// 主色跟随主题。Palette 的取值在渲染时才读，主题一变两个根视图重绘就能带上新色
+    static var accent: Color { ThemeStore.shared.current.accent }
     static let record = Color(red: 1.00, green: 0.23, blue: 0.23)
     static let appleYellow = Color(red: 1.00, green: 0.84, blue: 0.04)
     static let glass = Color.black.opacity(0.42)
@@ -230,7 +276,7 @@ private struct WatermarkPreview: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .font(.system(size: fontSize, weight: .semibold))
+        .font(.system(size: fontSize, weight: .semibold, design: engine.watermarkFont.swiftUIDesign))
         .frame(width: maxWidth, alignment: .leading)
         // 和烧进视频的一致：不铺黑底，白字 + 描边阴影，画面干净
         .foregroundColor(.white)
@@ -240,6 +286,18 @@ private struct WatermarkPreview: View {
         .padding(.bottom, bottomInset)
         .onReceive(tick) { now = $0 }
         .allowsHitTesting(false)
+    }
+}
+
+/// 水印字体 → SwiftUI 字形（预览用；烧录走 WatermarkFont.uiFont，两边同一套 design）
+private extension WatermarkFont {
+    var swiftUIDesign: Font.Design {
+        switch self {
+        case .system:     return .default
+        case .rounded:    return .rounded
+        case .serif:      return .serif
+        case .monospaced: return .monospaced
+        }
     }
 }
 
@@ -369,6 +427,8 @@ struct CameraScreen: View {
     @ObservedObject var engine: CameraEngine
     /// 监听语言：中英切换时整屏重绘
     @ObservedObject private var lang = Lang.shared
+    /// 监听主题：换主色时整屏重绘（Palette.accent 是动态取值）
+    @ObservedObject private var theme = ThemeStore.shared
     @State private var showSettings = false
     @State private var showDuration = false
     @State private var showFormat = false
@@ -639,7 +699,7 @@ struct CameraScreen: View {
             .clipShape(Capsule())
             .padding(.top, 10)
         } else {
-            // 这里是"预录快捷键"：点一下直接开关预录；预录时长在右下角的计时器按钮里设
+            // 这里是"预录快捷键"：点一下直接开关预录；预录时长在右下角的预录按钮里设
             Button {
                 engine.preRecordOn.toggle()
             } label: {
@@ -660,7 +720,7 @@ struct CameraScreen: View {
                             .foregroundColor(.white)
                     }
                     VStack(alignment: .leading, spacing: 0) {
-                        // 没开预录时只显示设置好的时长（时长在右下角计时器按钮里改）
+                        // 没开预录时只显示设置好的时长（时长在右下角预录按钮里改）
                         Text(engine.preRecordOn ? timeText(engine.preRecordSeconds)
                                                 : engine.preRecordDelay.label)
                             .font(Palette.mono(15, .bold))
@@ -688,7 +748,7 @@ struct CameraScreen: View {
         return min(max(CGFloat(engine.preRecordSeconds) / CGFloat(window), 0), 1)
     }
 
-    // MARK: 设置预录时长（右下角计时器按钮）
+    // MARK: 设置预录时长（右下角预录按钮）
     private var durationPicker: some View {
         ZStack {
             Color.black.opacity(0.45)
@@ -736,11 +796,10 @@ struct CameraScreen: View {
         } label: {
             Text(title)
                 .font(.system(size: 13, weight: .medium))
-                .foregroundColor(.white)
+                .foregroundColor(selected ? .black : .white)
                 .frame(maxWidth: .infinity)
                 .frame(height: 40)
-                .background(selected ? Color(red: 0.13, green: 0.48, blue: 0.95)
-                                     : Color.white.opacity(0.10))
+                .background(selected ? Palette.accent : Color.white.opacity(0.10))
                 .cornerRadius(8)
         }
         .buttonStyle(PlainButtonStyle())
@@ -819,11 +878,10 @@ struct CameraScreen: View {
         Button(action: action) {
             Text(title)
                 .font(.system(size: 13, weight: .medium))
-                .foregroundColor(.white)
+                .foregroundColor(selected ? .black : .white)
                 .frame(maxWidth: .infinity)
                 .frame(height: 40)
-                .background(selected ? Color(red: 0.13, green: 0.48, blue: 0.95)
-                                     : Color.white.opacity(0.10))
+                .background(selected ? Palette.accent : Color.white.opacity(0.10))
                 .cornerRadius(8)
         }
         .buttonStyle(PlainButtonStyle())
@@ -859,6 +917,22 @@ struct CameraScreen: View {
             .padding(4)
             .background(Color.white.opacity(0.12))
             .clipShape(Capsule())
+
+            // 字体：换一套水印字形，预览和烧进视频的一致
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 8) {
+                    Image(systemName: "textformat")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.55))
+                        .frame(width: 16)
+                    Text(L("字体", "Font"))
+                        .font(.system(size: 13.5, weight: .medium))
+                        .foregroundColor(.white.opacity(0.85))
+                }
+                SettingSegments(options: WatermarkFont.allCases,
+                                title: { $0.title },
+                                selection: $engine.watermarkFont)
+            }
 
             ScrollView {
                 VStack(spacing: 0) {
@@ -1003,7 +1077,7 @@ struct CameraScreen: View {
 
                 // 右：水印 + 预录时长
                 watermarkButton
-                ToolButton(icon: "timer", title: L("计时", "Timer")) { showDuration = true }
+                ToolButton(icon: "timer", title: L("预录", "Pre-rec")) { showDuration = true }
             }
         }
         .padding(.horizontal, 20)
@@ -1347,6 +1421,8 @@ struct SettingsSheet: View {
     @Environment(\.presentationMode) private var presentation
     /// 监听语言：中英切换时整页重绘
     @ObservedObject private var lang = Lang.shared
+    /// 监听主题：换主色时整页重绘（Palette.accent 是动态取值）
+    @ObservedObject private var theme = ThemeStore.shared
     @State private var startInput = ""
     @State private var stopInput = ""
     @State private var words: (start: [String], stop: [String]) = ([], [])
@@ -1420,6 +1496,11 @@ struct SettingsSheet: View {
 
                         SettingsCard(icon: "mappin.and.ellipse", title: L("水印", "Watermark")) {
                             SettingToggleRow(icon: "text.viewfinder", title: L("时间地点水印", "Time & Location Watermark"), isOn: $engine.watermarkOn)
+                            SettingRow(icon: "textformat", title: L("水印字体", "Watermark Font")) {
+                                SettingSegments(options: WatermarkFont.allCases,
+                                                title: { $0.title },
+                                                selection: $engine.watermarkFont)
+                            }
                             if engine.watermarkOn {
                                 HStack {
                                     Text(L("当前地点", "Current Place")).font(.system(size: 13)).foregroundColor(.white.opacity(0.7))
@@ -1522,6 +1603,31 @@ struct SettingsSheet: View {
                             SettingToggleRow(icon: "internaldrive.fill", title: L("显示剩余空间", "Show Free Space"), isOn: $engine.showStorage)
                             SettingNote(text: L("左上角那个「剩余空间 / 可录时长」的胶囊。默认关闭，想看再打开。",
                                                 "The free space / recordable time pill at the top-left. Off by default; turn it on when you want it."))
+                        }
+
+                        // 主题配色：多套主色，一键切换并记忆
+                        SettingsCard(icon: "paintpalette.fill", title: L("主题配色", "Theme")) {
+                            SettingSegments(options: AppTheme.allCases,
+                                            title: { $0.label },
+                                            selection: $theme.current)
+                            SettingNote(text: L("切换后按钮、开关、选中态的颜色立即变化，选择会被记住。",
+                                                "Button, toggle and highlight colors change immediately, and your choice is remembered."))
+                        }
+
+                        // 联系方式：展示抖音 / QQ 客服
+                        SettingsCard(icon: "bubble.left.and.bubble.right.fill", title: L("联系我们", "Contact Us")) {
+                            SettingRow(icon: "video.fill", title: L("抖音账号", "Douyin")) {
+                                Text("84393019417")
+                                    .font(Palette.mono(15, .semibold))
+                                    .foregroundColor(Palette.accent)
+                            }
+                            SettingRow(icon: "message.fill", title: L("QQ 客服", "QQ Support")) {
+                                Text("2188888999")
+                                    .font(Palette.mono(15, .semibold))
+                                    .foregroundColor(Palette.accent)
+                            }
+                            SettingNote(text: L("关注抖音账号获取最新版本与使用教程；使用中遇到问题可联系 QQ 客服。",
+                                                "Follow our Douyin for the latest version and tutorials; contact QQ support if you run into problems."))
                         }
 
                         // 语言：底部切换，选中即生效并记忆
