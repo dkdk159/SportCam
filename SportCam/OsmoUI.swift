@@ -130,42 +130,71 @@ enum AppTheme: String, CaseIterable, Identifiable {
         }
     }
 
-    /// 把基准色朝黑（深色主题）或白（浅色主题）混合，f = 朝目标靠的比例
-    private func mix(_ target: Double, _ f: Double) -> Color {
+    // MARK: 派生配色
+    //
+    // 思路对齐 Apple 官方 App（设置 / 相机 / 健康）：背景和卡片一律走「中性色」，
+    // 主色只在上面薄薄掺一点做气质，饱和的亮色留给按钮 / 开关 / 高亮这类可交互元素。
+    // 之前的做法是把基准色直接往纯黑 / 纯白里拉 —— 深色会糊成一团看不出层次的暗色，
+    // 浅色又几乎等于纯白，正是「太刺眼」的根因。改成固定锚点 + 少量掺色后，
+    // 每套主题依旧看得出自己的颜色，但整体干净、有层次、不扎眼。
+
+    /// 浅色锚点：柔和灰白，刻意不用纯白（HIG：soften white backgrounds）
+    private static let lightAnchor = (0.906, 0.914, 0.929)
+    /// 深色锚点：近黑但非纯黑（HIG 建议 #121212 一类），比纯黑更留得住层次
+    private static let darkAnchor = (0.062, 0.066, 0.078)
+
+    /// 在中性锚点上掺入主题基准色：t = 掺色比例（越大气质越浓），lift = 整体明暗微调
+    private func tone(_ t: Double, lift: Double = 0) -> Color {
+        let a = isLight ? Self.lightAnchor : Self.darkAnchor
         let b = base
-        return Color(red: b.0 + (target - b.0) * f,
-                     green: b.1 + (target - b.1) * f,
-                     blue: b.2 + (target - b.2) * f)
+        return Color(red:   Self.clamp(a.0 + (b.0 - a.0) * t + lift),
+                     green: Self.clamp(a.1 + (b.1 - a.1) * t + lift),
+                     blue:  Self.clamp(a.2 + (b.2 - a.2) * t + lift))
     }
+
+    private static func clamp(_ v: Double) -> Double { min(max(v, 0), 1) }
 
     /// 主色：按钮选中态 / 开关 / 高亮文字
     var accent: Color { Color(red: base.0, green: base.1, blue: base.2) }
 
-    /// 选择器上的色卡：跟截图一样走对角渐变，一眼看出这套的整体气质
+    /// 主色实心块上的文字：按主色明暗自动选黑字或白字，任何主题都保证读得清
+    var onAccent: Color { Self.luma(base) > 0.62 ? Color.black : Color.white }
+
+    /// 页面背景：上浅下深两段渐变，主题色只掺一点点，基调始终是干净的中性色
+    private var bgTop: Color { tone(isLight ? 0.10 : 0.17, lift: isLight ? 0.012 : 0.014) }
+    private var bgBottom: Color { tone(isLight ? 0.05 : 0.06, lift: isLight ? -0.045 : -0.012) }
+
+    /// 选择器上的色卡：背景 → 主色 → 背景的对角渐变，一眼看出整套气质
     var swatch: LinearGradient {
         LinearGradient(colors: [bgTop, accent.opacity(isLight ? 0.35 : 0.85), bgBottom],
                        startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
-    /// 页面背景：从上到下的双色渐变，整套主题的基调就看它
+    /// 页面背景
     var background: LinearGradient {
         LinearGradient(colors: [bgTop, bgBottom], startPoint: .top, endPoint: .bottom)
     }
 
-    private var bgTop: Color { isLight ? mix(1, 0.86) : mix(0, 0.90) }
-    private var bgBottom: Color { isLight ? mix(1, 0.80) : mix(0, 0.96) }
+    /// 卡片底色：比背景亮一档形成层次（elevation）；浅色是柔和米白，不是纯白
+    var surface: Color {
+        isLight ? tone(0.08, lift: 0.058).opacity(0.96)
+                : tone(0.16, lift: 0.055).opacity(0.82)
+    }
 
-    /// 卡片底色：带主题色调的半透明面板，压住背景渐变
-    var surface: Color { isLight ? Color.white.opacity(0.72) : mix(0, 0.72).opacity(0.55) }
+    /// 次级底色：输入框 / 未选中的胶囊（比卡片再亮一点，形成内凹层次）
+    var surfaceHi: Color {
+        isLight ? tone(0.10, lift: 0.030).opacity(0.92)
+                : tone(0.16, lift: 0.095).opacity(0.85)
+    }
 
-    /// 次级底色：输入框 / 未选中的胶囊
-    var surfaceHi: Color { isLight ? mix(1, 0.62).opacity(0.90) : mix(0, 0.58).opacity(0.45) }
+    /// 描边：跟着主题走的淡色勾边（浅色背景上要稍实一点才看得出来）
+    var border: Color { accent.opacity(isLight ? 0.24 : 0.30) }
 
-    /// 描边：跟着主题走的淡色勾边
-    var border: Color { accent.opacity(isLight ? 0.30 : 0.32) }
-
-    /// 不透明面板底色：直接压在取景画面上时用（如专业参数面板）
-    var panel: Color { isLight ? mix(1, 0.90) : mix(0, 0.92) }
+    /// 不透明面板底色：压在取景画面上时用（如专业参数面板），保持中性不串色
+    var panel: Color {
+        isLight ? tone(0.06, lift: 0.045).opacity(0.98)
+                : tone(0.10, lift: 0.048).opacity(0.98)
+    }
 }
 
 /// 当前主题。改它会立刻让主界面 / 设置页重绘（两个视图都监听它）。
@@ -232,8 +261,8 @@ private enum Palette {
     static func text(_ opacity: Double) -> Color {
         isLight ? Color.black.opacity(opacity) : Color.white.opacity(opacity)
     }
-    /// 主色实心块上的文字：深色主题配黑字，浅色主题配白字
-    static var onAccent: Color { isLight ? Color.white : Color.black }
+    /// 主色实心块上的文字：按当前主色明暗自动选黑字 / 白字（见 AppTheme.onAccent）
+    static var onAccent: Color { ThemeStore.shared.current.onAccent }
     /// 铺在取景画面上的浮层底色：不跟浅色主题变白，保证白字始终看得清
     static let overlayPanel = Color.black.opacity(0.55)
     static let record = Color(red: 1.00, green: 0.23, blue: 0.23)
