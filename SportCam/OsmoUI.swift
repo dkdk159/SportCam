@@ -134,12 +134,12 @@ enum AppTheme: String, CaseIterable, Identifiable {
     //
     // 思路对齐 Apple 官方 App（设置 / 相机 / 健康）：背景和卡片一律走「中性色」，
     // 主色只在上面薄薄掺一点做气质，饱和的亮色留给按钮 / 开关 / 高亮这类可交互元素。
-    // 之前的做法是把基准色直接往纯黑 / 纯白里拉 —— 深色会糊成一团看不出层次的暗色，
-    // 浅色又几乎等于纯白，正是「太刺眼」的根因。改成固定锚点 + 少量掺色后，
-    // 每套主题依旧看得出自己的颜色，但整体干净、有层次、不扎眼。
+    // 之前的做法是把基准色直接往纯黑 / 纯白里拉 —— 深色会糊成一团看不出层次的暗色。
+    // 浅色则对齐 iOS「设置」页：灰底 + 纯白卡片，靠「灰衬白」的对比来柔化观感，
+    // 而不是把白压成灰（整片压灰反而发闷，纯白卡片浮在灰底上才最像原生、最舒服）。
 
-    /// 浅色锚点：柔和灰白，刻意不用纯白（HIG：soften white backgrounds）
-    private static let lightAnchor = (0.906, 0.914, 0.929)
+    /// 浅色背景锚点：直接取 iOS 分组背景色 #F2F2F7
+    private static let lightAnchor = (0.949, 0.949, 0.969)
     /// 深色锚点：近黑但非纯黑（HIG 建议 #121212 一类），比纯黑更留得住层次
     private static let darkAnchor = (0.062, 0.066, 0.078)
 
@@ -161,8 +161,8 @@ enum AppTheme: String, CaseIterable, Identifiable {
     var onAccent: Color { Self.luma(base) > 0.62 ? Color.black : Color.white }
 
     /// 页面背景：上浅下深两段渐变，主题色只掺一点点，基调始终是干净的中性色
-    private var bgTop: Color { tone(isLight ? 0.10 : 0.17, lift: isLight ? 0.012 : 0.014) }
-    private var bgBottom: Color { tone(isLight ? 0.05 : 0.06, lift: isLight ? -0.045 : -0.012) }
+    private var bgTop: Color { tone(isLight ? 0.025 : 0.17, lift: isLight ? 0.008 : 0.014) }
+    private var bgBottom: Color { tone(isLight ? 0.025 : 0.06, lift: isLight ? -0.026 : -0.012) }
 
     /// 选择器上的色卡：背景 → 主色 → 背景的对角渐变，一眼看出整套气质
     var swatch: LinearGradient {
@@ -175,24 +175,27 @@ enum AppTheme: String, CaseIterable, Identifiable {
         LinearGradient(colors: [bgTop, bgBottom], startPoint: .top, endPoint: .bottom)
     }
 
-    /// 卡片底色：比背景亮一档形成层次（elevation）；浅色是柔和米白，不是纯白
+    /// 卡片底色：浅色是纯白卡片（浮在灰底上，就是 iOS 设置那个观感），深色比背景亮一档
     var surface: Color {
-        isLight ? tone(0.08, lift: 0.058).opacity(0.96)
+        isLight ? tone(0.02, lift: 0.052).opacity(0.99)
                 : tone(0.16, lift: 0.055).opacity(0.82)
     }
 
-    /// 次级底色：输入框 / 未选中的胶囊（比卡片再亮一点，形成内凹层次）
+    /// 次级底色：输入框 / 未选中的胶囊（浅色用 systemGray6，白卡上的浅灰内嵌块）
     var surfaceHi: Color {
-        isLight ? tone(0.10, lift: 0.030).opacity(0.92)
+        isLight ? tone(0.03, lift: -0.016).opacity(0.96)
                 : tone(0.16, lift: 0.095).opacity(0.85)
     }
 
-    /// 描边：跟着主题走的淡色勾边（浅色背景上要稍实一点才看得出来）
-    var border: Color { accent.opacity(isLight ? 0.24 : 0.30) }
+    /// 描边：浅色用 iOS 分隔线灰（白卡几乎无描边，最接近原生），深色跟着主色走
+    var border: Color {
+        isLight ? Color(red: 0.235, green: 0.235, blue: 0.263).opacity(0.32)
+                : accent.opacity(0.30)
+    }
 
     /// 不透明面板底色：压在取景画面上时用（如专业参数面板），保持中性不串色
     var panel: Color {
-        isLight ? tone(0.06, lift: 0.045).opacity(0.98)
+        isLight ? tone(0.02, lift: 0.008).opacity(0.98)
                 : tone(0.10, lift: 0.048).opacity(0.98)
     }
 }
