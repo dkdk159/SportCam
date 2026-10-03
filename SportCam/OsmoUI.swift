@@ -471,27 +471,34 @@ private struct WatermarkPreview: View {
 }
 
 /// 构图网格：三分线。
-/// 用 1 物理像素的实线 + 很淡的白，取景器那种细线；不用虚线（虚线太像演示稿，
-/// 亮场景下反而更抢眼）。线外压一层极淡暗影，白墙上也看得见。
+/// 双线画法：先铺一条略宽的深色线做「描边」，再压一条 1 物理像素的白线。
+/// 这样亮背景（白墙 / 桌面）上白线有深边不丢，暗背景上又是清晰的一条白线，
+/// 观感和取景器里的网格一样利落（不再用模糊阴影，那个会发虚、看着不清晰）。
 private struct GridOverlay: View {
     var body: some View {
         GeometryReader { geo in
             let hairline = 1 / UIScreen.main.scale
-            Path { path in
-                for index in 1..<3 {
-                    let x = (geo.size.width * CGFloat(index) / 3).rounded()
-                    path.move(to: CGPoint(x: x, y: 0))
-                    path.addLine(to: CGPoint(x: x, y: geo.size.height))
-
-                    let y = (geo.size.height * CGFloat(index) / 3).rounded()
-                    path.move(to: CGPoint(x: 0, y: y))
-                    path.addLine(to: CGPoint(x: geo.size.width, y: y))
-                }
-            }
-            .stroke(Color.white.opacity(0.22), lineWidth: hairline)
-            .shadow(color: .black.opacity(0.20), radius: 0.5)
+            gridPath(geo)
+                .stroke(Color.black.opacity(0.42), lineWidth: hairline * 2)
+            gridPath(geo)
+                .stroke(Color.white.opacity(0.58), lineWidth: hairline)
         }
         .allowsHitTesting(false)
+    }
+
+    /// 三分线路径：横竖各两条，落在 1/3、2/3 处并对齐物理像素，避免半像素发虚
+    private func gridPath(_ geo: GeometryProxy) -> Path {
+        Path { path in
+            for index in 1..<3 {
+                let x = (geo.size.width * CGFloat(index) / 3).rounded()
+                path.move(to: CGPoint(x: x, y: 0))
+                path.addLine(to: CGPoint(x: x, y: geo.size.height))
+
+                let y = (geo.size.height * CGFloat(index) / 3).rounded()
+                path.move(to: CGPoint(x: 0, y: y))
+                path.addLine(to: CGPoint(x: geo.size.width, y: y))
+            }
+        }
     }
 }
 
