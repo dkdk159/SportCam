@@ -46,8 +46,13 @@ enum AppTheme: String, CaseIterable, Identifiable {
     case amber = "amber"
     case sky = "sky"
     case violet = "violet"
+    case ink = "ink"
+    case snow = "snow"
 
     var id: String { rawValue }
+
+    /// 浅色主题：文字、卡片、边框都要反色，否则白底白字看不见
+    var isLight: Bool { self == .snow }
 
     /// 档位名（中英两套都写出来，跟着语言走）
     var label: String {
@@ -56,6 +61,8 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .amber:  return L("琥珀", "Amber")
         case .sky:    return L("天蓝", "Sky")
         case .violet: return L("紫罗兰", "Violet")
+        case .ink:    return L("纯黑", "Ink")
+        case .snow:   return L("纯白", "Snow")
         }
     }
 
@@ -66,7 +73,15 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .amber:  return Color(red: 1.00, green: 0.62, blue: 0.20)
         case .sky:    return Color(red: 0.26, green: 0.62, blue: 1.00)
         case .violet: return Color(red: 0.69, green: 0.50, blue: 1.00)
+        case .ink:    return Color(red: 0.82, green: 0.84, blue: 0.88)
+        case .snow:   return Color(red: 0.11, green: 0.13, blue: 0.18)
         }
+    }
+
+    /// 选择器上的色卡：跟截图一样走对角渐变，一眼看出这套的整体气质
+    var swatch: LinearGradient {
+        LinearGradient(colors: [bgTop, accent.opacity(isLight ? 0.30 : 0.85), bgBottom],
+                       startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
     /// 页面背景：从上到下的双色渐变，整套主题的基调就看它
@@ -80,6 +95,8 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .amber:  return Color(red: 0.145, green: 0.094, blue: 0.035)
         case .sky:    return Color(red: 0.043, green: 0.102, blue: 0.196)
         case .violet: return Color(red: 0.114, green: 0.075, blue: 0.196)
+        case .ink:    return Color(red: 0.106, green: 0.106, blue: 0.118)
+        case .snow:   return Color(red: 0.973, green: 0.976, blue: 0.984)
         }
     }
 
@@ -89,6 +106,8 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .amber:  return Color(red: 0.063, green: 0.039, blue: 0.014)
         case .sky:    return Color(red: 0.020, green: 0.047, blue: 0.098)
         case .violet: return Color(red: 0.047, green: 0.031, blue: 0.086)
+        case .ink:    return Color(red: 0.008, green: 0.008, blue: 0.010)
+        case .snow:   return Color(red: 0.878, green: 0.890, blue: 0.918)
         }
     }
 
@@ -99,6 +118,8 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .amber:  return Color(red: 0.30, green: 0.20, blue: 0.09).opacity(0.55)
         case .sky:    return Color(red: 0.10, green: 0.20, blue: 0.36).opacity(0.55)
         case .violet: return Color(red: 0.21, green: 0.14, blue: 0.35).opacity(0.55)
+        case .ink:    return Color(red: 0.17, green: 0.17, blue: 0.19).opacity(0.55)
+        case .snow:   return Color(red: 1.00, green: 1.00, blue: 1.00).opacity(0.78)
         }
     }
 
@@ -109,6 +130,8 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .amber:  return Color(red: 0.36, green: 0.24, blue: 0.11).opacity(0.45)
         case .sky:    return Color(red: 0.13, green: 0.25, blue: 0.44).opacity(0.45)
         case .violet: return Color(red: 0.26, green: 0.18, blue: 0.43).opacity(0.45)
+        case .ink:    return Color(red: 0.26, green: 0.26, blue: 0.29).opacity(0.45)
+        case .snow:   return Color(red: 0.85, green: 0.86, blue: 0.89).opacity(0.90)
         }
     }
 
@@ -119,6 +142,8 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .amber:  return Color(red: 0.78, green: 0.56, blue: 0.30).opacity(0.32)
         case .sky:    return Color(red: 0.34, green: 0.54, blue: 0.86).opacity(0.32)
         case .violet: return Color(red: 0.56, green: 0.44, blue: 0.82).opacity(0.32)
+        case .ink:    return Color(red: 0.60, green: 0.62, blue: 0.66).opacity(0.30)
+        case .snow:   return Color(red: 0.10, green: 0.12, blue: 0.18).opacity(0.16)
         }
     }
 
@@ -129,6 +154,8 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .amber:  return Color(red: 0.106, green: 0.067, blue: 0.024)
         case .sky:    return Color(red: 0.027, green: 0.063, blue: 0.129)
         case .violet: return Color(red: 0.075, green: 0.047, blue: 0.133)
+        case .ink:    return Color(red: 0.075, green: 0.075, blue: 0.086)
+        case .snow:   return Color(red: 0.945, green: 0.949, blue: 0.961)
         }
     }
 }
@@ -142,9 +169,17 @@ final class ThemeStore: ObservableObject {
         didSet { UserDefaults.standard.set(current.rawValue, forKey: Self.key) }
     }
 
+    /// 背景透明度：0 = 完全不透明，越大越透（设置页整页背景跟着变）
+    @Published var backgroundTransparency: Double {
+        didSet { UserDefaults.standard.set(backgroundTransparency, forKey: Self.bgKey) }
+    }
+
+    private static let bgKey = "app_bg_transparency"
+
     private init() {
         let saved = UserDefaults.standard.string(forKey: Self.key) ?? ""
         current = AppTheme(rawValue: saved) ?? .mint
+        backgroundTransparency = UserDefaults.standard.object(forKey: Self.bgKey) as? Double ?? 0
     }
 }
 
@@ -156,6 +191,16 @@ private enum Palette {
     static var surfaceHi: Color { ThemeStore.shared.current.surfaceHi }
     static var border: Color { ThemeStore.shared.current.border }
     static var panel: Color { ThemeStore.shared.current.panel }
+    /// 浅色主题判定：文字 / 卡片 / 边框按它反色
+    static var isLight: Bool { ThemeStore.shared.current.isLight }
+    /// 主题文字色：深色主题用白、浅色主题用黑，opacity 沿用原来的值，深浅两套都协调
+    static func text(_ opacity: Double) -> Color {
+        isLight ? Color.black.opacity(opacity) : Color.white.opacity(opacity)
+    }
+    /// 主色实心块上的文字：深色主题配黑字，浅色主题配白字
+    static var onAccent: Color { isLight ? Color.white : Color.black }
+    /// 铺在取景画面上的浮层底色：不跟浅色主题变白，保证白字始终看得清
+    static let overlayPanel = Color.black.opacity(0.55)
     static let record = Color(red: 1.00, green: 0.23, blue: 0.23)
     static let appleYellow = Color(red: 1.00, green: 0.84, blue: 0.04)
     static let glass = Color.black.opacity(0.42)
@@ -832,7 +877,7 @@ struct CameraScreen: View {
             }
             .padding(20)
             .frame(maxWidth: 320)
-            .background(Palette.surface)
+            .background(Palette.overlayPanel)
             .cornerRadius(16)
         }
     }
@@ -889,7 +934,7 @@ struct CameraScreen: View {
                     .padding(.top, 2)
 
                 HStack(spacing: 10) {
-                    ForEach(FrameRate.allCases) { item in
+                    ForEach(engine.frameRateOptions) { item in
                         formatCell(item.label, selected: engine.frameRate == item) {
                             engine.frameRate = item
                         }
@@ -926,7 +971,7 @@ struct CameraScreen: View {
             }
             .padding(20)
             .frame(maxWidth: 330)
-            .background(Palette.surface)
+            .background(Palette.overlayPanel)
             .cornerRadius(16)
         }
     }
@@ -1007,7 +1052,7 @@ struct CameraScreen: View {
         }
         .padding(18)
         .frame(maxWidth: 340)
-        .background(Palette.surface)
+        .background(Palette.overlayPanel)
         .cornerRadius(16)
         // 面板开着时每秒推一次：时间会走字，定位/天气晚回来也能马上填上
         .onReceive(panelTick) { _ in engine.refreshWatermarkIfNeeded() }
@@ -1263,7 +1308,7 @@ struct CameraScreen: View {
         .padding(.bottom, 12)
         .frame(maxWidth: .infinity)
         .background(
-            Palette.panel
+            Palette.overlayPanel
                 .clipShape(RoundedCorner(radius: 18, corners: [.topLeft, .topRight]))
         )
     }
@@ -1300,8 +1345,8 @@ private struct DescEditorView: View {
         NavigationView {
             Form {
                 Section(header: Text(L("水印描述", "Watermark Description")),
-                        footer: Text(L("这一行会原样写进水印，例如「钓鱼运动相机」。留空则不显示。",
-                                       "This line is written into the watermark as-is, e.g. \"Fishing Cam\". Leave empty to hide."))) {
+                        footer: Text(L("这一行会原样写进水印，例如「钓鱼预录相机Pro」。留空则不显示。",
+                                       "This line is written into the watermark as-is, e.g. \"Fishing Pre-record Cam Pro\". Leave empty to hide."))) {
                     TextField(L("输入描述", "Enter description"), text: $text)
                 }
             }
@@ -1333,7 +1378,7 @@ private struct SettingsCard<Content: View>: View {
                 Text(title)
                     .font(.system(size: 12, weight: .bold))
                     .tracking(1.2)
-                    .foregroundColor(.white.opacity(0.5))
+                    .foregroundColor(Palette.text(0.5))
             }
             VStack(alignment: .leading, spacing: 16) { content }
         }
@@ -1355,11 +1400,11 @@ private struct SettingRow<Content: View>: View {
             HStack(spacing: 8) {
                 Image(systemName: icon)
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.55))
+                    .foregroundColor(Palette.text(0.55))
                     .frame(width: 16)
                 Text(title)
                     .font(.system(size: 13.5, weight: .medium))
-                    .foregroundColor(.white.opacity(0.85))
+                    .foregroundColor(Palette.text(0.85))
             }
             content
         }
@@ -1377,16 +1422,16 @@ private struct SettingToggleRow: View {
         HStack(spacing: 10) {
             Image(systemName: icon)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(isOn ? Palette.accent : .white.opacity(0.5))
+                .foregroundColor(isOn ? Palette.accent : Palette.text(0.5))
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(.white.opacity(0.92))
+                    .foregroundColor(Palette.text(0.92))
                 if let caption = caption {
                     Text(caption)
                         .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor(Palette.text(0.4))
                 }
             }
             Spacer(minLength: 8)
@@ -1414,7 +1459,7 @@ private struct SettingSegments<T: Hashable>: View {
                     } label: {
                         Text(title(option))
                             .font(.system(size: 12.5, weight: .semibold))
-                            .foregroundColor(selected ? .black : .white.opacity(0.8))
+                            .foregroundColor(selected ? Palette.onAccent : Palette.text(0.8))
                             .padding(.horizontal, 14)
                             .padding(.vertical, 7)
                             .background(Capsule().fill(selected ? Palette.accent : Palette.surfaceHi))
@@ -1438,7 +1483,7 @@ private struct SettingField: View {
     var body: some View {
         TextField(placeholder, text: $text)
             .font(.system(size: 13.5))
-            .foregroundColor(.white)
+            .foregroundColor(Palette.text(1))
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
             .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Palette.surfaceHi))
@@ -1452,39 +1497,35 @@ private struct SettingNote: View {
     var body: some View {
         Text(text)
             .font(.system(size: 11))
-            .foregroundColor(.white.opacity(0.38))
+            .foregroundColor(Palette.text(0.38))
             .fixedSize(horizontal: false, vertical: true)
     }
 }
 
-/// 主题选择：四张色卡横排，每张直接画出该套的背景渐变 + 主色圆点，
-/// 选中的描一圈主色边并打勾 —— 比纯文字胶囊直观，一眼能看出换的是整套配色
+/// 主题选择：网格渐变色卡（3 列），切换整套配色
 private struct ThemeSwatchPicker: View {
     @Binding var selection: AppTheme
 
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
+
     var body: some View {
-        HStack(spacing: 10) {
+        LazyVGrid(columns: columns, spacing: 14) {
             ForEach(AppTheme.allCases) { theme in
                 let selected = theme == selection
                 Button {
                     withAnimation(.easeInOut(duration: 0.18)) { selection = theme }
                 } label: {
-                    VStack(spacing: 7) {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 12, style: .continuous).fill(theme.background)
-                            Circle()
-                                .fill(theme.accent)
-                                .frame(width: 18, height: 18)
-                                .shadow(color: theme.accent.opacity(0.8), radius: 6)
-                        }
-                        .frame(height: 56)
-                        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(selected ? theme.accent : Color.white.opacity(0.14),
-                                    lineWidth: selected ? 2 : 1))
-                        .overlay(checkmark(theme: theme).opacity(selected ? 1 : 0), alignment: .topTrailing)
+                    VStack(spacing: 6) {
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(theme.swatch)
+                            .frame(height: 62)
+                            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(selected ? Palette.accent : Palette.text(0.16),
+                                        lineWidth: selected ? 2.5 : 1))
+                            .overlay(checkmark(theme: theme).opacity(selected ? 1 : 0), alignment: .topTrailing)
                         Text(theme.label)
                             .font(.system(size: 11, weight: selected ? .bold : .medium))
-                            .foregroundColor(selected ? .white : .white.opacity(0.55))
+                            .foregroundColor(selected ? Palette.text(1) : Palette.text(0.55))
                     }
                 }
                 .buttonStyle(.plain)
@@ -1492,12 +1533,12 @@ private struct ThemeSwatchPicker: View {
         }
     }
 
-    /// 选中角标：主色实心圆 + 黑勾
+    /// 选中角标：主色实心圆 + 反色勾
     private func checkmark(theme: AppTheme) -> some View {
         Image(systemName: "checkmark")
-            .font(.system(size: 8, weight: .black))
-            .foregroundColor(.black)
-            .frame(width: 16, height: 16)
+            .font(.system(size: 9, weight: .black))
+            .foregroundColor(Palette.onAccent)
+            .frame(width: 18, height: 18)
             .background(Circle().fill(theme.accent))
             .padding(5)
     }
@@ -1519,7 +1560,10 @@ struct SettingsSheet: View {
     var body: some View {
         NavigationView {
             ZStack {
-                Palette.themeBackground.ignoresSafeArea()
+                (theme.current.isLight ? Color.white : Color.black).ignoresSafeArea()
+                Palette.themeBackground
+                    .opacity(1 - theme.backgroundTransparency)
+                    .ignoresSafeArea()
                 ScrollView {
                     VStack(spacing: 16) {
                         SettingsCard(icon: "camera.aperture", title: L("画面", "Video")) {
@@ -1530,11 +1574,12 @@ struct SettingsSheet: View {
                                                 disabled: engine.isRecording)
                             }
                             SettingRow(icon: "speedometer", title: L("帧率", "Frame Rate")) {
-                                SettingSegments(options: FrameRate.allCases,
+                                SettingSegments(options: engine.frameRateOptions,
                                                 title: { $0.label },
                                                 selection: $engine.frameRate,
                                                 disabled: engine.isRecording)
                             }
+                            SettingToggleRow(icon: "wand.and.stars", title: L("自动帧率", "Auto Frame Rate"), isOn: $engine.autoFrameRate)
                             if !engine.actualResolution.isEmpty {
                                 HStack(spacing: 5) {
                                     Image(systemName: "checkmark.seal.fill")
@@ -1542,7 +1587,7 @@ struct SettingsSheet: View {
                                         .foregroundColor(Palette.accent)
                                     Text("\(L("实际输出", "Output")) \(engine.actualResolution)")
                                         .font(.system(size: 11))
-                                        .foregroundColor(.white.opacity(0.45))
+                                        .foregroundColor(Palette.text(0.45))
                                 }
                             }
                             SettingRow(icon: "camera.metering.center.weighted", title: L("视角", "Field of View")) {
@@ -1585,22 +1630,22 @@ struct SettingsSheet: View {
                             SettingToggleRow(icon: "text.viewfinder", title: L("时间地点水印", "Time & Location Watermark"), isOn: $engine.watermarkOn)
                             if engine.watermarkOn {
                                 HStack {
-                                    Text(L("当前地点", "Current Place")).font(.system(size: 13)).foregroundColor(.white.opacity(0.7))
+                                    Text(L("当前地点", "Current Place")).font(.system(size: 13)).foregroundColor(Palette.text(0.7))
                                     Spacer()
                                     Text(engine.watermarkData.place.isEmpty
                                          ? (engine.locationNote.isEmpty ? L("定位中…", "Locating…") : engine.locationNote)
                                          : engine.watermarkData.place)
                                         .font(.system(size: 13))
-                                        .foregroundColor(.white.opacity(0.45))
+                                        .foregroundColor(Palette.text(0.45))
                                         .lineLimit(2)
                                         .multilineTextAlignment(.trailing)
                                 }
                                 HStack {
-                                    Text(L("天气数据", "Weather Data")).font(.system(size: 13)).foregroundColor(.white.opacity(0.7))
+                                    Text(L("天气数据", "Weather Data")).font(.system(size: 13)).foregroundColor(Palette.text(0.7))
                                     Spacer()
                                     Text(engine.watermarkData.hasWeather ? L("已就绪", "Ready") : L("获取中…", "Fetching…"))
                                         .font(.system(size: 13))
-                                        .foregroundColor(.white.opacity(0.45))
+                                        .foregroundColor(Palette.text(0.45))
                                 }
                             }
                             SettingNote(text: L("水印烧进画面左下角，预览同款显示。需要定位权限，天气需联网；关闭后不定位、不联网、不写入。显示哪些内容，在拍摄界面右下角「水印时间」里逐项勾选。",
@@ -1645,7 +1690,7 @@ struct SettingsSheet: View {
                             } label: {
                                 Text(L("保存口令", "Save Phrases"))
                                     .font(.system(size: 13, weight: .semibold))
-                                    .foregroundColor(.black)
+                                    .foregroundColor(Palette.onAccent)
                                     .frame(maxWidth: .infinity)
                                     .padding(.vertical, 9)
                                     .background(Capsule().fill(Palette.accent))
@@ -1690,8 +1735,18 @@ struct SettingsSheet: View {
                         // 界面主题：整套配色一起换
                         SettingsCard(icon: "paintpalette.fill", title: L("界面主题", "Theme")) {
                             ThemeSwatchPicker(selection: $theme.current)
-                            SettingNote(text: L("整套配色一起换：背景、卡片、边框、按钮和开关的颜色都跟着变，选择会被记住。",
-                                                "Switches the whole palette — background, cards, borders, buttons and toggles all follow. Your choice is remembered."))
+                            SettingRow(icon: "circle.lefthalf.filled", title: L("背景透明度", "Background Transparency")) {
+                                HStack(spacing: 12) {
+                                    Slider(value: $theme.backgroundTransparency, in: 0...0.8)
+                                        .accentColor(Palette.accent)
+                                    Text("\(Int(theme.backgroundTransparency * 100))%")
+                                        .font(Palette.mono(12))
+                                        .foregroundColor(Palette.text(0.6))
+                                        .frame(width: 44, alignment: .trailing)
+                                }
+                            }
+                            SettingNote(text: L("整套配色一起换：背景、卡片、边框、按钮和开关的颜色都跟着变，选择会被记住。背景透明度调高，设置页背景越透、越暗。",
+                                                "Switches the whole palette — background, cards, borders, buttons and toggles all follow. Your choice is remembered. Higher background transparency makes the settings background more see-through and darker."))
                         }
 
                         // 联系方式：展示抖音 / QQ 客服
@@ -1729,7 +1784,7 @@ struct SettingsSheet: View {
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundColor(Palette.accent))
         }
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(theme.current.isLight ? .light : .dark)
         .onAppear {
             words = (engine.startWords, engine.stopWords)
             startInput = words.start.joined(separator: ",")

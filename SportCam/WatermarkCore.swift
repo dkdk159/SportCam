@@ -46,7 +46,7 @@ enum WatermarkItem: String, CaseIterable, Identifiable {
 /// 水印要用的实时数据。定位和天气各填一半，谁先回来谁先显示，互不阻塞。
 struct WatermarkData {
     var place = ""
-    var desc = L("运动相机", "Sport Camera")
+    var desc = L("钓鱼预录相机Pro", "Fishing Pre-record Cam Pro")
     var altitude = 0.0
     var hasAltitude = false
     var weather = ""

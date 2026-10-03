@@ -493,7 +493,22 @@ final class CameraEngine: NSObject, ObservableObject {
     // 参数
     @Published var fieldOfView: FieldOfView = .wide { didSet { if oldValue != fieldOfView { switchLens() } } }
     @Published var quality: VideoQuality = .p1080 { didSet { if oldValue != quality { reconfigure() } } }
-    @Published var frameRate: FrameRate = .auto { didSet { if oldValue != frameRate { applyFrameRate() } } }
+    @Published var frameRate: FrameRate = .fps30 { didSet { if oldValue != frameRate { applyFrameRate() } } }
+    /// 自动帧率：默认关闭，开了才用「自动」档（取当前画质能给到的最高帧率）
+    @Published var autoFrameRate = false {
+        didSet {
+            guard oldValue != autoFrameRate else { return }
+            if autoFrameRate {
+                if frameRate != .auto { frameRate = .auto }
+            } else if frameRate == .auto {
+                frameRate = .fps30
+            }
+        }
+    }
+    /// 帧率可选项：没开自动帧率就不显示「自动」，默认就是 30fps
+    var frameRateOptions: [FrameRate] {
+        autoFrameRate ? FrameRate.allCases : [.fps24, .fps30, .fps60]
+    }
     @Published var antiShake: AntiShake = .standard { didSet { if oldValue != antiShake { attachConnections() } } }
     @Published var zoom: CGFloat = 1.0 { didSet { if oldValue != zoom { applyZoom() } } }
     // 专业参数：0 表示自动
