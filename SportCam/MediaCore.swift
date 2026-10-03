@@ -3,6 +3,7 @@ import AVFoundation
 import VideoToolbox
 import CoreMedia
 import CoreVideo
+import AudioToolbox
 
 // ============================================================
 //  媒体核心：日志 / sampleBuffer 工具 / H.264 编码器 / 提示音
@@ -159,87 +160,19 @@ final class H264Encoder {
 }
 
 // MARK: - 提示音
+/// 用苹果自带的系统声音，和 iPhone 自带相机录像时的提示音一致：
+/// 1113 = begin_record.caf（开始录像）、1114 = end_record.caf（结束录像）。
+/// 走 AudioServicesPlaySystemSound（不是自己合成波形），是系统音效，听感更自然。
+/// 注：AVCaptureEventSound 那套是 iOS 26 才有的，本 App 部署目标 iOS 14，用不了。
 final class SoundPlayer {
-    private let queue = DispatchQueue(label: "com.sportcam.sound")
-    private var startPlayer: AVAudioPlayer?
-    private var stopPlayer: AVAudioPlayer?
+    private static let startID: SystemSoundID = 1113
+    private static let stopID: SystemSoundID = 1114
 
-    private static let startTone = makeTone([(0.00, 0.07), (0.12, 0.07), (0.24, 0.16)])
-    private static let stopTone = makeTone([(0.00, 0.20)])
+    /// 保留预热接口（引擎在 launch 里会调用）；系统音效无需预热，直接播放。
+    func prepare() {}
 
-    /// 预热：把两个提示音提前建好并 prepareToPlay。
-    /// 原来每次点击才 AVAudioPlayer(data:) + 现场合成波形 + prepare，
-    /// 第一次按下去必然慢半拍 —— "开始/停止迟钝"有一部分就出在这儿。
-    func prepare() {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            if self.startPlayer == nil { self.startPlayer = Self.build(Self.startTone) }
-            if self.stopPlayer == nil { self.stopPlayer = Self.build(Self.stopTone) }
-        }
-    }
-
-    func playStart() { play(isStart: true) }
-    func playStop() { play(isStart: false) }
-
-    private func play(isStart: Bool) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            var audio = isStart ? self.startPlayer : self.stopPlayer
-            if audio == nil {
-                // 还没预热过（比如刚启动就被点）：现场建一个，顺手存下来下次直接用
-                audio = Self.build(isStart ? Self.startTone : Self.stopTone)
-                if isStart { self.startPlayer = audio } else { self.stopPlayer = audio }
-            }
-            // 上一条还在响就从头重放，不等它播完 —— 连点两次也要两次都有声
-            audio?.currentTime = 0
-            audio?.play()
-        }
-    }
-
-    private static func build(_ data: Data) -> AVAudioPlayer? {
-        guard let player = try? AVAudioPlayer(data: data) else { return nil }
-        player.volume = 1.0
-        player.prepareToPlay()
-        return player
-    }
-
-    private static func makeTone(_ pattern: [(Double, Double)]) -> Data {
-        let sampleRate = 44100
-        let frequency = 880.0
-        // 提示音是外放喇叭放出来的，麦克风就在旁边。
-        // 原来 28000（约满量程 85%），录进视频里会直接把话筒推爆 → "爆音/吱吱"。
-        // 降到 11000（约 34%）既能听清，又不会录成爆音。
-        let amplitude = 11000.0
-        let total = Int(0.7 * Double(sampleRate))
-        var samples = [Int16](repeating: 0, count: total)
-
-        for (startAt, duration) in pattern {
-            let start = Int(startAt * Double(sampleRate))
-            let length = Int(duration * Double(sampleRate))
-            for index in 0..<length {
-                let position = start + index
-                if position >= total { break }
-                let t = Double(index) / Double(sampleRate)
-                samples[position] = Int16(sin(2 * Double.pi * frequency * t) * amplitude * exp(-t * 18.0))
-            }
-        }
-
-        var data = Data()
-        data.append(contentsOf: Array("RIFF".utf8))
-        var size = UInt32(36 + total * 2); data.append(Data(bytes: &size, count: 4))
-        data.append(contentsOf: Array("WAVEfmt ".utf8))
-        var subchunk = UInt32(16); data.append(Data(bytes: &subchunk, count: 4))
-        var format = UInt16(1); data.append(Data(bytes: &format, count: 2))
-        var channels = UInt16(1); data.append(Data(bytes: &channels, count: 2))
-        var rate = UInt32(sampleRate); data.append(Data(bytes: &rate, count: 4))
-        var byteRate = UInt32(sampleRate * 2); data.append(Data(bytes: &byteRate, count: 4))
-        var align = UInt16(2); data.append(Data(bytes: &align, count: 2))
-        var bits = UInt16(16); data.append(Data(bytes: &bits, count: 2))
-        data.append(contentsOf: Array("data".utf8))
-        var dataSize = UInt32(total * 2); data.append(Data(bytes: &dataSize, count: 4))
-        samples.withUnsafeBytes { data.append(contentsOf: $0) }
-        return data
-    }
+    func playStart() { AudioServicesPlaySystemSound(Self.startID) }
+    func playStop() { AudioServicesPlaySystemSound(Self.stopID) }
 }
 
 // MARK: - 分段落盘录制器

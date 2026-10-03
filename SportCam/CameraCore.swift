@@ -19,12 +19,14 @@ enum FieldOfView: String, CaseIterable, Identifiable {
     case ultraWide = "超广角"
     case wide = "广角"
     case telephoto = "长焦"
+    case multiCam = "多摄"
     var id: String { rawValue }
     var lens: AVCaptureDevice.DeviceType {
         switch self {
         case .ultraWide: return .builtInUltraWideCamera
         case .wide: return .builtInWideAngleCamera
         case .telephoto: return .builtInTelephotoCamera
+        case .multiCam: return .builtInTripleCamera
         }
     }
 }
@@ -66,11 +68,13 @@ enum VideoQuality: String, CaseIterable, Identifiable {
 }
 
 enum FrameRate: Int, CaseIterable, Identifiable {
+    case auto = 0
     case fps24 = 24
     case fps30 = 30
     case fps60 = 60
     var id: Int { rawValue }
-    var label: String { "\(rawValue)" }
+    /// 自动 = 取当前画质能给出的最高帧率
+    var label: String { self == .auto ? "自动" : "\(rawValue)fps" }
 }
 
 enum AntiShake: String, CaseIterable, Identifiable {
@@ -150,6 +154,17 @@ enum PowerSaveDelay: Int, CaseIterable, Identifiable {
         case .never: return "永不息屏"
         }
     }
+}
+
+/// 低电量强制保存阈值：录制中电量降到这个百分比就自动停止并保存
+enum BatteryThreshold: Int, CaseIterable, Identifiable {
+    case p5 = 5
+    case p10 = 10
+    case p15 = 15
+    case p20 = 20
+    case p30 = 30
+    var id: Int { rawValue }
+    var label: String { "\(rawValue)%" }
 }
 
 // MARK: - 语音控制
@@ -449,7 +464,7 @@ final class CameraEngine: NSObject, ObservableObject {
     // 参数
     @Published var fieldOfView: FieldOfView = .wide { didSet { if oldValue != fieldOfView { switchLens() } } }
     @Published var quality: VideoQuality = .p1080 { didSet { if oldValue != quality { reconfigure() } } }
-    @Published var frameRate: FrameRate = .fps30 { didSet { if oldValue != frameRate { applyFrameRate() } } }
+    @Published var frameRate: FrameRate = .auto { didSet { if oldValue != frameRate { applyFrameRate() } } }
     @Published var antiShake: AntiShake = .standard { didSet { if oldValue != antiShake { attachConnections() } } }
     @Published var zoom: CGFloat = 1.0 { didSet { if oldValue != zoom { applyZoom() } } }
     // 专业参数：0 表示自动
@@ -479,6 +494,13 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var denoiseNote = ""
     @Published var beepOn = true
     @Published var debugInfo = false
+    /// 夜钓自动补光：录制中画面偏暗时自动开手电，变亮自动关（带回差，不会忽明忽暗）
+    @Published var nightAutoLight = false
+    /// 自动最广视野：开启后自动切到本机最广的镜头（有超广角用超广角）
+    @Published var autoWidest = false { didSet { if oldValue != autoWidest && autoWidest { applyWidestView() } } }
+    /// 低电量强制保存：录制中电量降到阈值就自动停止并保存
+    @Published var lowBatterySaveOn = false
+    @Published var batteryThreshold: BatteryThreshold = .p10
     /// 语音控制默认开启：装好即可直接说「开始录像」「停止录像」
     @Published var voiceOn = true { didSet { if oldValue != voiceOn { voiceOn ? startVoice() : stopVoice() } } }
     @Published var startWords = ["开始录像", "开启录像", "开始录制", "开始拍摄"]
@@ -547,6 +569,15 @@ final class CameraEngine: NSObject, ObservableObject {
     private var deliveredSize = CGSize.zero
     /// 最近一次真正写进设备的帧率（按活动格式夹过），用来纠偏界面上的帧率选项（sessionQueue 上读写）
     private var appliedFPS = 0
+    /// 编码器实际该用的帧率：优先用设备真实生效的那个；自动帧率还没算出来时兜底 30
+    private var effectiveFPS: Int {
+        if appliedFPS > 0 { return appliedFPS }
+        return frameRate == .auto ? 30 : frameRate.rawValue
+    }
+    /// 夜钓自动补光：上一次测画面亮度的时间（sessionQueue 上读写，1 秒一测，别每帧都算）
+    private var lastNightCheck = Date.distantPast
+    /// 手电是不是被"夜钓自动补光"打开的：是的话停止录制时顺手关掉，手动开的灯不动
+    private var autoTorchOn = false
     /// 最近一帧的像素缓冲（sessionQueue 上读写）。翻转前把它转成图片当过渡帧用。
     private var latestPixelBuffer: CVPixelBuffer?
     /// 转图片用，建一次复用；放 sessionQueue 上用
@@ -674,7 +705,11 @@ final class CameraEngine: NSObject, ObservableObject {
         }
 
         power.start { [weak self] value in
-            DispatchQueue.main.async { self?.battery = value }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.battery = value
+                self.checkLowBattery()          // 低电量保护：到阈值自动停录保存
+            }
         }
 
         encoder.onSample = { [weak self] sample in self?.onEncoded(sample) }
@@ -790,7 +825,7 @@ final class CameraEngine: NSObject, ObservableObject {
         applyDenoiseLocked()
         session.startRunning()
         attachConnectionsLocked()
-        Log.write("[会话] 启动 \(quality.rawValue) \(frameRate.rawValue)fps \(fieldOfView.rawValue)")
+        Log.write("[会话] 启动 \(quality.rawValue) \(frameRate.label) \(fieldOfView.rawValue)")
     }
 
     private func camera(_ position: AVCaptureDevice.Position, fieldOfView fov: FieldOfView) -> AVCaptureDevice? {
@@ -798,6 +833,7 @@ final class CameraEngine: NSObject, ObservableObject {
             return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
         }
         if fov == .ultraWide, let ultra = ultraWideDevice() { return ultra }
+        if fov == .multiCam, let multi = multiCamDevice() { return multi }
         return AVCaptureDevice.default(fov.lens, for: .video, position: .back)
             ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
     }
@@ -806,6 +842,7 @@ final class CameraEngine: NSObject, ObservableObject {
     /// 用来在切焦段之前判断"到底需不需要动会话"。
     private func lensDevice(_ fov: FieldOfView) -> AVCaptureDevice? {
         if fov == .ultraWide { return ultraWideDevice() }
+        if fov == .multiCam { return multiCamDevice() }
         return AVCaptureDevice.default(fov.lens, for: .video, position: .back)
     }
 
@@ -828,6 +865,14 @@ final class CameraEngine: NSObject, ObservableObject {
         if let ultra = devices.first(where: { $0.deviceType == .builtInUltraWideCamera }) { return ultra }
         if let triple = devices.first(where: { $0.deviceType == .builtInTripleCamera }) { return triple }
         if let dualWide = devices.first(where: { $0.deviceType == .builtInDualWideCamera }) { return dualWide }
+        return nil
+    }
+
+    /// 后置「多摄」虚拟设备：三摄优先，其次双广角。老机型（如 iPhone 8 Plus）没有，
+    /// 返回 nil，设置里的「视角」就不会摆出这一项 —— 一切都是按本机真实能力适配。
+    private func multiCamDevice() -> AVCaptureDevice? {
+        if let device = AVCaptureDevice.default(.builtInTripleCamera, for: .video, position: .back) { return device }
+        if let device = AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: .back) { return device }
         return nil
     }
 
@@ -936,6 +981,8 @@ final class CameraEngine: NSObject, ObservableObject {
                 // 先落 cameraPosition 再落 fieldOfView：前者已是 .front 时，
                 // fieldOfView 的 didSet 会走 switchLens，被"前置不支持切换焦段"挡掉，正好不动会话
                 self.fieldOfView = fov
+                // 自动最广视野：翻回后置时重新套用最广镜头
+                if self.autoWidest, next == .back { self.applyWidestView() }
                 self.torchOn = false        // 上面已经把灯关了，按钮同步灭掉
                 self.zoom = 1.0
                 self.exposureBias = 0
@@ -1037,7 +1084,9 @@ final class CameraEngine: NSObject, ObservableObject {
     /// 换摄像头时会带着新设备在 beginConfiguration 块里调用 —— 让"换 input"和"换格式"
     /// 合并成同一次中断；等 commitConfiguration 之后再动 activeFormat，预览会再黑一下。
     private func applyFrameRateLocked(on device: AVCaptureDevice) {
-        let fps = Double(frameRate.rawValue)
+        let auto = (frameRate == .auto)
+        // 自动帧率：挑格式时不设帧率门槛，选完再取该格式能给的最高帧率
+        let fps = auto ? 0 : Double(frameRate.rawValue)
         let target = quality.size
         let key = "\(device.uniqueID)|\(quality.rawValue)|\(frameRate.rawValue)"
 
@@ -1060,6 +1109,7 @@ final class CameraEngine: NSObject, ObservableObject {
                     guard w >= target.width, h >= target.height else { return false }
                     let aspect = Double(w) / Double(h)
                     guard abs(aspect - wanted) < 0.06 else { return false }
+                    if auto { return true }      // 自动帧率不限帧率，交给后面取最高
                     return format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= fps && fps <= $0.maxFrameRate }
                 }
                 return list.min { lhs, rhs in
@@ -1087,8 +1137,9 @@ final class CameraEngine: NSObject, ObservableObject {
             // ObjC 异常（NSInvalidArgumentException），而 Swift 的 do/catch 只能接 NSError，
             // 接不住 ObjC 异常 → 当场闪退。这正是"选 4:3/4K 闪退、翻转闪退"的根因。
             // 所以这里先夹到格式能给的范围内，再把实际用上的帧率记下来供界面纠偏。
-            let wanted = Double(frameRate.rawValue)
             let ranges = device.activeFormat.videoSupportedFrameRateRanges
+            // 自动帧率 = 直接要这颗格式能给的最高帧率
+            let wanted = auto ? (ranges.map { $0.maxFrameRate }.max() ?? 30) : Double(frameRate.rawValue)
             let fitting = ranges.filter { $0.minFrameRate <= wanted + 0.01 && wanted <= $0.maxFrameRate + 0.01 }
             let effective: Double
             if let range = fitting.min(by: { abs($0.maxFrameRate - wanted) < abs($1.maxFrameRate - wanted) }) {
@@ -1114,6 +1165,8 @@ final class CameraEngine: NSObject, ObservableObject {
     /// 在 sessionQueue 上调用（读 appliedFPS）。
     private func syncFrameRateOption() {
         let applied = appliedFPS
+        // 自动帧率是"有意为之"，不把选项改成某个具体值
+        guard frameRate != .auto else { return }
         guard applied > 0, applied != frameRate.rawValue, let matched = FrameRate(rawValue: applied) else { return }
         Log.write("[会话] 帧率实际为 \(applied)fps，选项已同步")
         DispatchQueue.main.async { [weak self] in
@@ -1320,6 +1373,15 @@ final class CameraEngine: NSObject, ObservableObject {
     /// 本机后置真实存在的镜头。设置里的「视角」只列有的，免得选了没反应。
     var availableFieldOfViews: [FieldOfView] {
         FieldOfView.allCases.filter { lensDevice($0) != nil }
+    }
+
+    /// 自动最广视野：切到本机最广的镜头（有超广角就 0.5x，没有就广角 1x）。
+    /// 全部走本机真实能力判定，离线 / 省电模式 / 飞行模式都不受影响（不依赖网络）。
+    private func applyWidestView() {
+        guard cameraPosition == .back else { return }
+        let fov: FieldOfView = ultraWideAvailable ? .ultraWide : .wide
+        if fieldOfView != fov { fieldOfView = fov }   // didSet 会走 switchLens
+        zoom = 1.0
     }
 
     /// 已经授权过定位的话，启动时先悄悄取一次位置。
@@ -1852,6 +1914,8 @@ final class CameraEngine: NSObject, ObservableObject {
             self.isRecording = false
             self.stopRecordTimer()
             self.isBusy = true
+            // 夜钓自动补光的灯，停止录制后顺手关掉省电；手动开的灯不动
+            if self.autoTorchOn { self.setTorch(false, auto: false) }
         }
         resetPowerTimer()
 
@@ -1977,26 +2041,87 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     // MARK: 手电筒
+    /// 手动开关手电筒。手动操作不再由夜钓自动补光托管。
     func toggleTorch() {
+        setTorch(!torchOn, auto: false)
+    }
+
+    /// 设定手电筒开关（手动 / 夜钓自动补光共用）。
+    /// 必须 lockForConfiguration 成功后才能改 torchMode，否则抛 ObjC 异常当场闪退。
+    private func setTorch(_ on: Bool, auto: Bool) {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
-            let next = !self.torchOn
             guard let device = self.cameraDevice, device.hasTorch,
-                  device.isTorchModeSupported(next ? .on : .off) else {
-                // 这颗镜头没有闪光灯（比如前置）：别把按钮点亮了骗人
-                DispatchQueue.main.async { self.torchOn = false }
+                  device.isTorchModeSupported(on ? .on : .off) else {
+                // 这颗镜头没有闪光灯（比如前置 / 超广角）：别把按钮点亮了骗人
+                if !on { DispatchQueue.main.async { self.torchOn = false } }
                 return
             }
-            // 同 toggleCamera：取锁失败就不能再改 torchMode，否则直接崩
             do {
                 try device.lockForConfiguration()
-                device.torchMode = next ? .on : .off
+                device.torchMode = on ? .on : .off
                 device.unlockForConfiguration()
-                DispatchQueue.main.async { self.torchOn = next }
+                DispatchQueue.main.async {
+                    self.torchOn = on
+                    self.autoTorchOn = on && auto
+                }
             } catch {
                 Log.write("[手电筒] 失败：\(error.localizedDescription)")
             }
         }
+    }
+
+    /// 夜钓自动补光：录制中每秒看一次画面亮度，暗到阈值自动开手电，变亮再关。
+    /// 用两个阈值做回差（开 < 0.15，关 > 0.30），避免灯一亮又照回自己导致反复闪烁。
+    private func checkNightLight(_ pixelBuffer: CVPixelBuffer) {
+        let now = Date()
+        guard now.timeIntervalSince(lastNightCheck) >= 1.0 else { return }
+        lastNightCheck = now
+        guard let luma = averageLuma(pixelBuffer) else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.nightAutoLight, self.isRecording else { return }
+            if luma < 0.15, !self.torchOn {
+                self.setTorch(true, auto: true)
+            } else if luma > 0.30, self.torchOn, self.autoTorchOn {
+                self.setTorch(false, auto: true)
+            }
+        }
+    }
+
+    /// 取 Y 平面（亮度）平均值。稀疏采样，够用且几乎不耗时（只在 sessionQueue 上调用）。
+    private func averageLuma(_ pixelBuffer: CVPixelBuffer) -> Double? {
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard CVPixelBufferIsPlanar(pixelBuffer),
+              let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else { return nil }
+        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        guard width > 0, height > 0 else { return nil }
+        let stepX = max(width / 32, 1)
+        let stepY = max(height / 32, 1)
+        var sum = 0.0
+        var count = 0
+        let row = base.assumingMemoryBound(to: UInt8.self)
+        for y in Swift.stride(from: 0, to: height, by: stepY) {
+            let line = row + y * bytesPerRow
+            for x in Swift.stride(from: 0, to: width, by: stepX) {
+                sum += Double(line[x])
+                count += 1
+            }
+        }
+        guard count > 0 else { return nil }
+        return sum / Double(count) / 255.0
+    }
+
+    /// 低电量强制保存：录制中电量降到阈值就自动停止并保存，避免断电把文件丢掉。
+    private func checkLowBattery() {
+        guard lowBatterySaveOn, isRecording else { return }
+        let raw = UIDevice.current.batteryLevel
+        guard raw >= 0 else { return }        // -1 = 读不到电量，别误触发
+        guard raw <= Float(batteryThreshold.rawValue) / 100.0 else { return }
+        message("电量低于 \(batteryThreshold.rawValue)%，已自动停止并保存")
+        stopRecording()
     }
 
     // MARK: 计时 / 提示 / 省电
@@ -2087,6 +2212,8 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
         // 留一份最新帧：翻转时拿它当"换镜头前的最后一帧"，盖住会话重连时的黑屏
         latestPixelBuffer = pixelBuffer
+        // 夜钓自动补光：录制中周期性测画面亮度，决定要不要开手电
+        if nightAutoLight && recording { checkNightLight(pixelBuffer) }
         // 翻转后新镜头的第一帧到了：开始淡出过渡帧（覆盖期结束）
         if flipFadeArmed {
             flipFadeArmed = false
@@ -2123,7 +2250,7 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
                 lastEncoderTry = now
                 needEncoderRebuild = false
                 encoder.configure(width: width, height: height,
-                                  fps: frameRate.rawValue,
+                                  fps: effectiveFPS,
                                   bitrate: max(width * height * 3, 6_000_000))
             }
         }

@@ -494,7 +494,7 @@ struct CameraScreen: View {
                     showFormat = true
                 } label: {
                     HStack(spacing: 5) {
-                        Text("\(engine.quality.rawValue)/\(engine.frameRate.rawValue)fps")
+                        Text("\(engine.quality.rawValue)/\(engine.frameRate.label)")
                             .font(Palette.mono(11))
                         Image(systemName: "chevron.down")
                             .font(.system(size: 8, weight: .bold))
@@ -718,7 +718,7 @@ struct CameraScreen: View {
 
                 HStack(spacing: 10) {
                     ForEach(FrameRate.allCases) { item in
-                        formatCell("\(item.rawValue)fps", selected: engine.frameRate == item) {
+                        formatCell(item.label, selected: engine.frameRate == item) {
                             engine.frameRate = item
                         }
                     }
@@ -951,22 +951,12 @@ struct CameraScreen: View {
     }
 
     /// 水印：点开面板，逐项勾选（时间/地点/描述/海拔/天气/温度/气压/风速）
+    /// 和左右两侧其它按钮一样做成 46 的圆，底栏一排按钮尺寸统一、不再一大一小。
     private var watermarkButton: some View {
-        Button {
+        CircleIcon(icon: "textformat", active: engine.watermarkOn, diameter: 46) {
             showWatermark = true
             engine.ensureWatermarkStarted()
-        } label: {
-            Text("水印时间")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(engine.watermarkOn ? .black : .white)
-                .padding(.horizontal, 13)
-                .frame(height: 46)
-                .background(engine.watermarkOn ? Palette.accent : Palette.glass)
-                .clipShape(Capsule())
-                .overlay(Capsule().stroke(engine.watermarkOn ? Color.clear : Palette.border, lineWidth: 0.5))
-                .animation(.easeOut(duration: 0.18), value: engine.watermarkOn)
         }
-        .buttonStyle(PlainButtonStyle())
     }
 
     /// 一个按钮管全部专业参数：点开面板，里面六项随便切
@@ -1319,7 +1309,7 @@ struct SettingsSheet: View {
                             }
                             SettingRow(icon: "speedometer", title: "帧率") {
                                 SettingSegments(options: FrameRate.allCases,
-                                                title: { "\($0.rawValue)fps" },
+                                                title: { $0.label },
                                                 selection: $engine.frameRate,
                                                 disabled: engine.isRecording)
                             }
@@ -1339,6 +1329,8 @@ struct SettingsSheet: View {
                                                 selection: $engine.fieldOfView,
                                                 disabled: engine.isRecording || engine.cameraPosition == .front)
                             }
+                            SettingToggleRow(icon: "viewfinder", title: "自动最广视野", isOn: $engine.autoWidest)
+                            SettingNote(text: "镜头按本机真实能力适配：只列出这台机器真有的（前置/后置、超广角/广角/长焦/多摄）。自动最广视野开启后，自动切到最广的镜头。镜头切换是本地操作，无信号、飞行模式、省电模式下都能用。")
                             SettingRow(icon: "hand.raised.fill", title: "防抖") {
                                 SettingSegments(options: AntiShake.allCases,
                                                 title: { $0.rawValue },
@@ -1347,10 +1339,21 @@ struct SettingsSheet: View {
                             }
                         }
 
+                        SettingsCard(icon: "moon.zzz.fill", title: "自动熄屏") {
+                            SettingRow(icon: "timer", title: "熄屏时间") {
+                                SettingSegments(options: PowerSaveDelay.allCases,
+                                                title: { $0.label },
+                                                selection: $engine.powerSave)
+                            }
+                            SettingNote(text: "到点自动熄屏省电，熄屏后继续录制，上滑屏幕即可唤醒。")
+                        }
+
                         SettingsCard(icon: "squareshape.split.3x3", title: "拍摄辅助") {
                             SettingToggleRow(icon: "grid", title: "构图网格", isOn: $engine.showGrid)
                             SettingToggleRow(icon: "level", title: "水平仪", isOn: $engine.showLevel)
                             SettingToggleRow(icon: "speaker.wave.2.fill", title: "录制提示音", isOn: $engine.beepOn)
+                            SettingToggleRow(icon: "lightbulb.fill", title: "夜钓自动补光", isOn: $engine.nightAutoLight)
+                            SettingNote(text: "提示音用的是苹果自带相机的录像声。夜钓自动补光：录制中画面变暗时自动开手电，变亮自动关，停止录制也会关灯省电；是否生效取决于当前镜头有没有闪光灯。")
                         }
 
                         SettingsCard(icon: "mappin.and.ellipse", title: "水印") {
@@ -1426,14 +1429,20 @@ struct SettingsSheet: View {
 
                         SettingsCard(icon: "bolt.fill", title: "性能与续航") {
                             SettingToggleRow(icon: "waveform.badge.mic", title: "降噪", isOn: $engine.denoiseOn)
-                            SettingRow(icon: "moon.zzz.fill", title: "自动熄屏") {
-                                SettingSegments(options: PowerSaveDelay.allCases,
-                                                title: { $0.label },
-                                                selection: $engine.powerSave)
-                            }
                             SettingNote(text: engine.denoiseOn && !engine.denoiseNote.isEmpty
-                                        ? "降噪已生效：\(engine.denoiseNote)\n熄屏后继续录制，上滑屏幕即可唤醒。"
-                                        : "降噪：抑制麦克风风噪，并在暗光下压制画面噪点（是否可用取决于机型和系统）。熄屏后继续录制，上滑屏幕即可唤醒。")
+                                        ? "降噪已生效：\(engine.denoiseNote)"
+                                        : "降噪：抑制麦克风风噪，并在暗光下压制画面噪点（是否可用取决于机型和系统）。")
+                        }
+
+                        SettingsCard(icon: "battery.100", title: "低电量保护") {
+                            SettingToggleRow(icon: "battery.25", title: "低电量强制保存", isOn: $engine.lowBatterySaveOn)
+                            SettingRow(icon: "percent", title: "阈值") {
+                                SettingSegments(options: BatteryThreshold.allCases,
+                                                title: { $0.label },
+                                                selection: $engine.batteryThreshold,
+                                                disabled: !engine.lowBatterySaveOn)
+                            }
+                            SettingNote(text: "录制中电量降到阈值时自动停止并保存当前视频，避免突然断电把文件丢掉。当前电量 \(Int(engine.battery * 100))%。")
                         }
 
                         SettingsCard(icon: "hand.tap.fill", title: "按键") {
