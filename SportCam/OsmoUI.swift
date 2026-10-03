@@ -42,45 +42,108 @@ func L(_ zh: String, _ en: String) -> String {
 /// 不是只换按钮颜色 —— 每套主题带着自己的背景渐变和卡片底色，
 /// 切过去整页气质就变了。所有颜色都在渲染时取，主题一变两个根视图重绘即可生效。
 enum AppTheme: String, CaseIterable, Identifiable {
-    case mint = "mint"
-    case amber = "amber"
     case sky = "sky"
+    case azure = "azure"
+    case mint = "mint"
+    case teal = "teal"
+    case lime = "lime"
+    case honey = "honey"
+    case amber = "amber"
+    case coral = "coral"
+    case rose = "rose"
+    case crimson = "crimson"
     case violet = "violet"
+    case purple = "purple"
+    case indigo = "indigo"
+    case cyan = "cyan"
+    case emerald = "emerald"
+    case navy = "navy"
     case ink = "ink"
-    case snow = "snow"
+    case mist = "mist"
+    case custom = "custom"
 
     var id: String { rawValue }
 
-    /// 浅色主题：文字、卡片、边框都要反色，否则白底白字看不见
-    var isLight: Bool { self == .snow }
+    /// 浅色主题：文字、卡片、边框都要反色，否则浅底浅字看不见。
+    /// 雾灰固定算浅色；自定义主题按所选颜色的亮度自动判定（亮色反色、暗色正常）。
+    var isLight: Bool {
+        switch self {
+        case .mist:   return true
+        case .custom: return Self.luma(ThemeStore.shared.customBase) > 0.66
+        default:      return false
+        }
+    }
+
+    /// 感知亮度（sRGB 加权），用来判断自定义色算不算浅色
+    private static func luma(_ c: (Double, Double, Double)) -> Double {
+        0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2
+    }
 
     /// 档位名（中英两套都写出来，跟着语言走）
     var label: String {
         switch self {
-        case .mint:   return L("青绿", "Mint")
-        case .amber:  return L("琥珀", "Amber")
         case .sky:    return L("天蓝", "Sky")
+        case .azure:  return L("湖蓝", "Azure")
+        case .mint:   return L("青绿", "Mint")
+        case .teal:   return L("青碧", "Teal")
+        case .lime:   return L("柠檬", "Lime")
+        case .honey:  return L("蜜黄", "Honey")
+        case .amber:  return L("琥珀", "Amber")
+        case .coral:  return L("珊瑚", "Coral")
+        case .rose:   return L("玫红", "Rose")
+        case .crimson: return L("绯红", "Crimson")
         case .violet: return L("紫罗兰", "Violet")
+        case .purple: return L("深紫", "Purple")
+        case .indigo: return L("靛蓝", "Indigo")
+        case .cyan:   return L("青蓝", "Cyan")
+        case .emerald: return L("翡翠", "Emerald")
+        case .navy:   return L("藏青", "Navy")
         case .ink:    return L("纯黑", "Ink")
-        case .snow:   return L("纯白", "Snow")
+        case .mist:   return L("雾灰", "Mist")
+        case .custom: return L("自定义", "Custom")
         }
+    }
+
+    /// 每套只写一个基准色，背景 / 卡片 / 边框都由它朝黑或朝白混出来，
+    /// 想加新配色只要在 base 和 label 里各补一行。
+    private var base: (Double, Double, Double) {
+        switch self {
+        case .sky:    return (0.26, 0.62, 1.00)
+        case .azure:  return (0.16, 0.70, 0.96)
+        case .mint:   return (0.20, 0.86, 0.70)
+        case .teal:   return (0.09, 0.72, 0.74)
+        case .lime:   return (0.72, 0.88, 0.20)
+        case .honey:  return (0.95, 0.75, 0.10)
+        case .amber:  return (1.00, 0.62, 0.20)
+        case .coral:  return (0.98, 0.42, 0.45)
+        case .rose:   return (0.96, 0.28, 0.62)
+        case .crimson: return (0.92, 0.18, 0.30)
+        case .violet: return (0.69, 0.50, 1.00)
+        case .purple: return (0.62, 0.24, 0.96)
+        case .indigo: return (0.44, 0.42, 0.98)
+        case .cyan:   return (0.12, 0.78, 0.94)
+        case .emerald: return (0.06, 0.74, 0.44)
+        case .navy:   return (0.18, 0.30, 0.72)
+        case .ink:    return (0.82, 0.84, 0.88)
+        case .mist:   return (0.34, 0.38, 0.46)
+        case .custom: return ThemeStore.shared.customBase
+        }
+    }
+
+    /// 把基准色朝黑（深色主题）或白（浅色主题）混合，f = 朝目标靠的比例
+    private func mix(_ target: Double, _ f: Double) -> Color {
+        let b = base
+        return Color(red: b.0 + (target - b.0) * f,
+                     green: b.1 + (target - b.1) * f,
+                     blue: b.2 + (target - b.2) * f)
     }
 
     /// 主色：按钮选中态 / 开关 / 高亮文字
-    var accent: Color {
-        switch self {
-        case .mint:   return Color(red: 0.20, green: 0.86, blue: 0.70)
-        case .amber:  return Color(red: 1.00, green: 0.62, blue: 0.20)
-        case .sky:    return Color(red: 0.26, green: 0.62, blue: 1.00)
-        case .violet: return Color(red: 0.69, green: 0.50, blue: 1.00)
-        case .ink:    return Color(red: 0.82, green: 0.84, blue: 0.88)
-        case .snow:   return Color(red: 0.11, green: 0.13, blue: 0.18)
-        }
-    }
+    var accent: Color { Color(red: base.0, green: base.1, blue: base.2) }
 
     /// 选择器上的色卡：跟截图一样走对角渐变，一眼看出这套的整体气质
     var swatch: LinearGradient {
-        LinearGradient(colors: [bgTop, accent.opacity(isLight ? 0.30 : 0.85), bgBottom],
+        LinearGradient(colors: [bgTop, accent.opacity(isLight ? 0.35 : 0.85), bgBottom],
                        startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
@@ -89,75 +152,20 @@ enum AppTheme: String, CaseIterable, Identifiable {
         LinearGradient(colors: [bgTop, bgBottom], startPoint: .top, endPoint: .bottom)
     }
 
-    private var bgTop: Color {
-        switch self {
-        case .mint:   return Color(red: 0.043, green: 0.129, blue: 0.118)
-        case .amber:  return Color(red: 0.145, green: 0.094, blue: 0.035)
-        case .sky:    return Color(red: 0.043, green: 0.102, blue: 0.196)
-        case .violet: return Color(red: 0.114, green: 0.075, blue: 0.196)
-        case .ink:    return Color(red: 0.106, green: 0.106, blue: 0.118)
-        case .snow:   return Color(red: 0.973, green: 0.976, blue: 0.984)
-        }
-    }
-
-    private var bgBottom: Color {
-        switch self {
-        case .mint:   return Color(red: 0.016, green: 0.055, blue: 0.051)
-        case .amber:  return Color(red: 0.063, green: 0.039, blue: 0.014)
-        case .sky:    return Color(red: 0.020, green: 0.047, blue: 0.098)
-        case .violet: return Color(red: 0.047, green: 0.031, blue: 0.086)
-        case .ink:    return Color(red: 0.008, green: 0.008, blue: 0.010)
-        case .snow:   return Color(red: 0.878, green: 0.890, blue: 0.918)
-        }
-    }
+    private var bgTop: Color { isLight ? mix(1, 0.86) : mix(0, 0.90) }
+    private var bgBottom: Color { isLight ? mix(1, 0.80) : mix(0, 0.96) }
 
     /// 卡片底色：带主题色调的半透明面板，压住背景渐变
-    var surface: Color {
-        switch self {
-        case .mint:   return Color(red: 0.10, green: 0.26, blue: 0.24).opacity(0.55)
-        case .amber:  return Color(red: 0.30, green: 0.20, blue: 0.09).opacity(0.55)
-        case .sky:    return Color(red: 0.10, green: 0.20, blue: 0.36).opacity(0.55)
-        case .violet: return Color(red: 0.21, green: 0.14, blue: 0.35).opacity(0.55)
-        case .ink:    return Color(red: 0.17, green: 0.17, blue: 0.19).opacity(0.55)
-        case .snow:   return Color(red: 1.00, green: 1.00, blue: 1.00).opacity(0.78)
-        }
-    }
+    var surface: Color { isLight ? Color.white.opacity(0.72) : mix(0, 0.72).opacity(0.55) }
 
     /// 次级底色：输入框 / 未选中的胶囊
-    var surfaceHi: Color {
-        switch self {
-        case .mint:   return Color(red: 0.13, green: 0.33, blue: 0.30).opacity(0.45)
-        case .amber:  return Color(red: 0.36, green: 0.24, blue: 0.11).opacity(0.45)
-        case .sky:    return Color(red: 0.13, green: 0.25, blue: 0.44).opacity(0.45)
-        case .violet: return Color(red: 0.26, green: 0.18, blue: 0.43).opacity(0.45)
-        case .ink:    return Color(red: 0.26, green: 0.26, blue: 0.29).opacity(0.45)
-        case .snow:   return Color(red: 0.85, green: 0.86, blue: 0.89).opacity(0.90)
-        }
-    }
+    var surfaceHi: Color { isLight ? mix(1, 0.62).opacity(0.90) : mix(0, 0.58).opacity(0.45) }
 
     /// 描边：跟着主题走的淡色勾边
-    var border: Color {
-        switch self {
-        case .mint:   return Color(red: 0.32, green: 0.66, blue: 0.58).opacity(0.32)
-        case .amber:  return Color(red: 0.78, green: 0.56, blue: 0.30).opacity(0.32)
-        case .sky:    return Color(red: 0.34, green: 0.54, blue: 0.86).opacity(0.32)
-        case .violet: return Color(red: 0.56, green: 0.44, blue: 0.82).opacity(0.32)
-        case .ink:    return Color(red: 0.60, green: 0.62, blue: 0.66).opacity(0.30)
-        case .snow:   return Color(red: 0.10, green: 0.12, blue: 0.18).opacity(0.16)
-        }
-    }
+    var border: Color { accent.opacity(isLight ? 0.30 : 0.32) }
 
-    /// 不透明面板底色：直接压在取景画面上时用（如专业参数面板），保证读数清楚
-    var panel: Color {
-        switch self {
-        case .mint:   return Color(red: 0.035, green: 0.086, blue: 0.082)
-        case .amber:  return Color(red: 0.106, green: 0.067, blue: 0.024)
-        case .sky:    return Color(red: 0.027, green: 0.063, blue: 0.129)
-        case .violet: return Color(red: 0.075, green: 0.047, blue: 0.133)
-        case .ink:    return Color(red: 0.075, green: 0.075, blue: 0.086)
-        case .snow:   return Color(red: 0.945, green: 0.949, blue: 0.961)
-        }
-    }
+    /// 不透明面板底色：直接压在取景画面上时用（如专业参数面板）
+    var panel: Color { isLight ? mix(1, 0.90) : mix(0, 0.92) }
 }
 
 /// 当前主题。改它会立刻让主界面 / 设置页重绘（两个视图都监听它）。
@@ -175,11 +183,38 @@ final class ThemeStore: ObservableObject {
     }
 
     private static let bgKey = "app_bg_transparency"
+    private static let customKey = "app_theme_custom"
+
+    /// 「自定义」主题的基准色：用户用取色器自己挑，整套背景/卡片/边框都从它派生
+    @Published var customBase: (Double, Double, Double) {
+        didSet {
+            UserDefaults.standard.set([customBase.0, customBase.1, customBase.2],
+                                      forKey: Self.customKey)
+        }
+    }
+
+    /// 给 ColorPicker 用的绑定：读写都落到 customBase
+    var customColor: Binding<Color> {
+        Binding(
+            get: {
+                let c = self.customBase
+                return Color(red: c.0, green: c.1, blue: c.2)
+            },
+            set: { newColor in
+                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+                _ = UIColor(newColor).getRed(&r, &g, &b, &a)
+                self.customBase = (Double(r), Double(g), Double(b))
+            }
+        )
+    }
 
     private init() {
         let saved = UserDefaults.standard.string(forKey: Self.key) ?? ""
         current = AppTheme(rawValue: saved) ?? .mint
         backgroundTransparency = UserDefaults.standard.object(forKey: Self.bgKey) as? Double ?? 0
+        let savedRGB = UserDefaults.standard.array(forKey: Self.customKey) as? [Double]
+        customBase = (savedRGB?.count == 3) ? (savedRGB![0], savedRGB![1], savedRGB![2])
+                                            : (0.40, 0.62, 0.95)
     }
 }
 
@@ -680,10 +715,17 @@ struct CameraScreen: View {
             if showDuration && engine.proControl == nil { durationPicker }
             if showFormat && engine.proControl == nil { formatPicker }
             if showWatermark { watermarkPicker }
+
+            // 设置页做成叠在取景画面上的一层（不再用 sheet）：sheet 自带不透明底 +
+            // 系统导航栏，透不出后面的画面。叠在这里，背景透明度拉高就能真的看到取景画面。
+            if showSettings {
+                SettingsSheet(engine: engine, isPresented: $showSettings)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .zIndex(20)
+            }
         }
         .onAppear { engine.launch() }
         .statusBar(hidden: true)
-        .sheet(isPresented: $showSettings) { SettingsSheet(engine: engine) }
     }
 
     // MARK: 顶部（左上：剩余空间 + 画质；右上：电量 + 闪光灯）
@@ -762,7 +804,7 @@ struct CameraScreen: View {
                         engine.toggleCamera()
                     }
                     ToolButton(icon: "gearshape.fill", title: L("设置", "Settings")) {
-                        showSettings = true
+                        withAnimation(.easeInOut(duration: 0.28)) { showSettings = true }
                     }
                 }
             }
@@ -1546,7 +1588,9 @@ private struct ThemeSwatchPicker: View {
 
 struct SettingsSheet: View {
     @ObservedObject var engine: CameraEngine
-    @Environment(\.presentationMode) private var presentation
+    /// 显隐由父视图控制：设置页现在是叠在取景画面上的一层，
+    /// 背景透明后能真的看到后面的画面（而不是被纯黑/纯白垫底挡住）。
+    @Binding var isPresented: Bool
     /// 监听语言：中英切换时整页重绘
     @ObservedObject private var lang = Lang.shared
     /// 监听主题：换主色时整页重绘（Palette.accent 是动态取值）
@@ -1558,12 +1602,14 @@ struct SettingsSheet: View {
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        NavigationView {
-            ZStack {
-                (theme.current.isLight ? Color.white : Color.black).ignoresSafeArea()
-                Palette.themeBackground
-                    .opacity(1 - theme.backgroundTransparency)
-                    .ignoresSafeArea()
+        ZStack {
+            // 只铺主题渐变，底下不再垫任何纯色 —— 透明度拉满时整页真透明，
+            // 直接看到后面的取景画面。
+            Palette.themeBackground
+                .opacity(1 - theme.backgroundTransparency)
+                .ignoresSafeArea()
+            VStack(spacing: 0) {
+                header
                 ScrollView {
                     VStack(spacing: 16) {
                         SettingsCard(icon: "camera.aperture", title: L("画面", "Video")) {
@@ -1735,9 +1781,16 @@ struct SettingsSheet: View {
                         // 界面主题：整套配色一起换
                         SettingsCard(icon: "paintpalette.fill", title: L("界面主题", "Theme")) {
                             ThemeSwatchPicker(selection: $theme.current)
+                            // 选到「自定义」时才出现取色器：随便挑一个颜色，整套跟着它变
+                            if theme.current == .custom {
+                                SettingRow(icon: "eyedropper.halffull", title: L("自定义颜色", "Custom Color")) {
+                                    ColorPicker("", selection: theme.customColor, supportsOpacity: false)
+                                        .labelsHidden()
+                                }
+                            }
                             SettingRow(icon: "circle.lefthalf.filled", title: L("背景透明度", "Background Transparency")) {
                                 HStack(spacing: 12) {
-                                    Slider(value: $theme.backgroundTransparency, in: 0...0.8)
+                                    Slider(value: $theme.backgroundTransparency, in: 0...1)
                                         .accentColor(Palette.accent)
                                     Text("\(Int(theme.backgroundTransparency * 100))%")
                                         .font(Palette.mono(12))
@@ -1745,8 +1798,8 @@ struct SettingsSheet: View {
                                         .frame(width: 44, alignment: .trailing)
                                 }
                             }
-                            SettingNote(text: L("整套配色一起换：背景、卡片、边框、按钮和开关的颜色都跟着变，选择会被记住。背景透明度调高，设置页背景越透、越暗。",
-                                                "Switches the whole palette — background, cards, borders, buttons and toggles all follow. Your choice is remembered. Higher background transparency makes the settings background more see-through and darker."))
+                            SettingNote(text: L("整套配色一起换：背景、卡片、边框、按钮和开关的颜色都跟着变，选择会被记住。背景透明度是「真透明」：调高后设置页背景直接透出去，能看到后面的取景画面；拉到 100% 就只剩文字和卡片浮在画面上。",
+                                                "Switches the whole palette — background, cards, borders, buttons and toggles all follow, and your choice is remembered. Background transparency is real see-through: raise it and the settings background becomes transparent, revealing the camera view behind; at 100% only the text and cards float over the picture."))
                         }
 
                         // 联系方式：展示抖音 / QQ 客服
@@ -1779,11 +1832,8 @@ struct SettingsSheet: View {
                     .padding(.bottom, 34)
                 }
             }
-            .navigationBarTitle(L("设置", "Settings"), displayMode: .inline)
-            .navigationBarItems(trailing: Button(L("完成", "Done")) { presentation.wrappedValue.dismiss() }
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundColor(Palette.accent))
         }
+        .contentShape(Rectangle())
         .preferredColorScheme(theme.current.isLight ? .light : .dark)
         .onAppear {
             words = (engine.startWords, engine.stopWords)
@@ -1794,5 +1844,23 @@ struct SettingsSheet: View {
             engine.setVoiceWords(start: words.start, stop: words.stop)
         }
         .onReceive(tick) { _ in engine.refreshWatermarkIfNeeded() }
+    }
+
+    /// 自绘顶部栏：原来用 NavigationView 的导航栏，系统导航栏有不透明底，
+    /// 会把「透明看到屏幕」整个挡掉。这里换成跟着主题走的一条，底色随透明度一起淡出。
+    private var header: some View {
+        HStack {
+            Text(L("设置", "Settings"))
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundColor(Palette.text(0.95))
+            Spacer()
+            Button(L("完成", "Done")) { withAnimation(.easeInOut(duration: 0.24)) { isPresented = false } }
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(Palette.accent)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
+        .background(Palette.panel.opacity(0.9 * (1 - theme.backgroundTransparency)))
     }
 }
