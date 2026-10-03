@@ -1814,7 +1814,7 @@ struct SettingsSheet: View {
                             }
                             SettingRow(icon: "hand.raised.fill", title: L("隐私政策", "Privacy Policy")) {
                                 Button {
-                                    if let url = URL(string: "https://aiyulu.xyz/privacy.html") {
+                                    if let url = URL(string: "https://fishing.wanxiaozhi.store/") {
                                         UIApplication.shared.open(url, options: [:], completionHandler: nil)
                                     }
                                 } label: {
