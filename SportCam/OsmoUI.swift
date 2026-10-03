@@ -59,22 +59,14 @@ enum AppTheme: String, CaseIterable, Identifiable {
     case emerald = "emerald"
     case navy = "navy"
     case ink = "ink"
-    case mist = "mist"
-    case custom = "custom"
 
     var id: String { rawValue }
 
     /// 浅色主题：文字、卡片、边框都要反色，否则浅底浅字看不见。
-    /// 雾灰固定算浅色；自定义主题按所选颜色的亮度自动判定（亮色反色、暗色正常）。
-    var isLight: Bool {
-        switch self {
-        case .mist:   return true
-        case .custom: return Self.luma(ThemeStore.shared.customBase) > 0.66
-        default:      return false
-        }
-    }
+    /// 现有配色都是深色底，故恒为 false；保留此开关方便将来加入浅色主题。
+    var isLight: Bool { false }
 
-    /// 感知亮度（sRGB 加权），用来判断自定义色算不算浅色
+    /// 感知亮度（sRGB 加权），用来判断主色上该配黑字还是白字
     private static func luma(_ c: (Double, Double, Double)) -> Double {
         0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2
     }
@@ -99,8 +91,6 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .emerald: return L("翡翠", "Emerald")
         case .navy:   return L("藏青", "Navy")
         case .ink:    return L("纯黑", "Ink")
-        case .mist:   return L("雾灰", "Mist")
-        case .custom: return L("自定义", "Custom")
         }
     }
 
@@ -125,8 +115,6 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .emerald: return (0.06, 0.74, 0.44)
         case .navy:   return (0.18, 0.30, 0.72)
         case .ink:    return (0.82, 0.84, 0.88)
-        case .mist:   return (0.34, 0.38, 0.46)
-        case .custom: return ThemeStore.shared.customBase
         }
     }
 
@@ -215,38 +203,11 @@ final class ThemeStore: ObservableObject {
     }
 
     private static let bgKey = "app_bg_transparency"
-    private static let customKey = "app_theme_custom"
-
-    /// 「自定义」主题的基准色：用户用取色器自己挑，整套背景/卡片/边框都从它派生
-    @Published var customBase: (Double, Double, Double) {
-        didSet {
-            UserDefaults.standard.set([customBase.0, customBase.1, customBase.2],
-                                      forKey: Self.customKey)
-        }
-    }
-
-    /// 给 ColorPicker 用的绑定：读写都落到 customBase
-    var customColor: Binding<Color> {
-        Binding(
-            get: {
-                let c = self.customBase
-                return Color(red: c.0, green: c.1, blue: c.2)
-            },
-            set: { newColor in
-                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-                _ = UIColor(newColor).getRed(&r, green: &g, blue: &b, alpha: &a)
-                self.customBase = (Double(r), Double(g), Double(b))
-            }
-        )
-    }
 
     private init() {
         let saved = UserDefaults.standard.string(forKey: Self.key) ?? ""
-        current = AppTheme(rawValue: saved) ?? .mint
+        current = AppTheme(rawValue: saved) ?? .sky
         backgroundTransparency = UserDefaults.standard.object(forKey: Self.bgKey) as? Double ?? 0
-        let savedRGB = UserDefaults.standard.array(forKey: Self.customKey) as? [Double]
-        customBase = (savedRGB?.count == 3) ? (savedRGB![0], savedRGB![1], savedRGB![2])
-                                            : (0.40, 0.62, 0.95)
     }
 }
 
@@ -1230,8 +1191,13 @@ struct CameraScreen: View {
 
     private var shutterRow: some View {
         ZStack {
-            // 快门永远钉在屏幕正中央
-            shutterButton
+            // 快门永远钉在屏幕正中央。下方补一行与 ToolButton 同规格的隐形标签：
+            // ToolButton 的圆下面带标签，如果快门只有圆，四个圆钮会被标签顶高约 8pt，
+            // 圆心和快门圆心不在一条线上，看着就不齐。补上后五个圆心严格对齐。
+            VStack(spacing: 5) {
+                shutterButton
+                Text(" ").font(.system(size: 10, weight: .medium)).frame(width: 46)
+            }
 
             HStack(spacing: 14) {
                 // 左：相册 + 专业参数
@@ -1820,13 +1786,6 @@ struct SettingsSheet: View {
                         // 界面主题：整套配色一起换
                         SettingsCard(icon: "paintpalette.fill", title: L("界面主题", "Theme")) {
                             ThemeSwatchPicker(selection: $theme.current)
-                            // 选到「自定义」时才出现取色器：随便挑一个颜色，整套跟着它变
-                            if theme.current == .custom {
-                                SettingRow(icon: "eyedropper.halffull", title: L("自定义颜色", "Custom Color")) {
-                                    ColorPicker("", selection: theme.customColor, supportsOpacity: false)
-                                        .labelsHidden()
-                                }
-                            }
                             SettingRow(icon: "circle.lefthalf.filled", title: L("背景透明度", "Background Transparency")) {
                                 HStack(spacing: 12) {
                                     Slider(value: $theme.backgroundTransparency, in: 0...1)
