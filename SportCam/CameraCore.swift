@@ -21,6 +21,15 @@ enum FieldOfView: String, CaseIterable, Identifiable {
     case telephoto = "长焦"
     case multiCam = "多摄"
     var id: String { rawValue }
+    /// 界面上显示的镜头名（rawValue 保持稳定，只作 id 用）
+    var title: String {
+        switch self {
+        case .ultraWide: return L("超广角", "Ultra Wide")
+        case .wide:      return L("广角", "Wide")
+        case .telephoto: return L("长焦", "Telephoto")
+        case .multiCam:  return L("多摄", "Multi-cam")
+        }
+    }
     var lens: AVCaptureDevice.DeviceType {
         switch self {
         case .ultraWide: return .builtInUltraWideCamera
@@ -74,7 +83,7 @@ enum FrameRate: Int, CaseIterable, Identifiable {
     case fps60 = 60
     var id: Int { rawValue }
     /// 自动 = 取当前画质能给出的最高帧率
-    var label: String { self == .auto ? "自动" : "\(rawValue)fps" }
+    var label: String { self == .auto ? L("自动", "Auto") : "\(rawValue)fps" }
 }
 
 enum AntiShake: String, CaseIterable, Identifiable {
@@ -83,6 +92,15 @@ enum AntiShake: String, CaseIterable, Identifiable {
     case cinematic = "影院级"
     case auto = "自动"
     var id: String { rawValue }
+    /// 界面上显示的档位名
+    var title: String {
+        switch self {
+        case .off:       return L("关闭", "Off")
+        case .standard:  return L("标准", "Standard")
+        case .cinematic: return L("影院级", "Cinematic")
+        case .auto:      return L("自动", "Auto")
+        }
+    }
     var mode: AVCaptureVideoStabilizationMode {
         switch self {
         case .off: return .off
@@ -102,6 +120,17 @@ enum ProControl: String, CaseIterable, Identifiable {
     case focus = "对焦"
     case zoom = "变焦"
     var id: String { rawValue }
+    /// 界面上显示的参数名
+    var title: String {
+        switch self {
+        case .exposure:     return L("曝光", "Exposure")
+        case .shutter:      return L("快门", "Shutter")
+        case .iso:          return L("感光度", "ISO")
+        case .whiteBalance: return L("白平衡", "White Balance")
+        case .focus:        return L("对焦", "Focus")
+        case .zoom:         return L("变焦", "Zoom")
+        }
+    }
     var icon: String {
         switch self {
         case .exposure: return "sun.max.fill"
@@ -126,13 +155,13 @@ enum PreRecordDelay: Int, CaseIterable, Identifiable {
     var id: Int { rawValue }
     var label: String {
         switch self {
-        case .s5: return "5秒"
-        case .s10: return "10秒"
-        case .s15: return "15秒"
-        case .s30: return "30秒"
-        case .m1: return "1分钟"
-        case .m2: return "2分钟"
-        case .m5: return "5分钟"
+        case .s5: return L("5秒", "5s")
+        case .s10: return L("10秒", "10s")
+        case .s15: return L("15秒", "15s")
+        case .s30: return L("30秒", "30s")
+        case .m1: return L("1分钟", "1 min")
+        case .m2: return L("2分钟", "2 min")
+        case .m5: return L("5分钟", "5 min")
         }
     }
 }
@@ -147,11 +176,11 @@ enum PowerSaveDelay: Int, CaseIterable, Identifiable {
     var id: Int { rawValue }
     var label: String {
         switch self {
-        case .s5: return "5秒"
-        case .s15: return "15秒"
-        case .s30: return "30秒"
-        case .m1: return "1分钟"
-        case .never: return "永不息屏"
+        case .s5: return L("5秒", "5s")
+        case .s15: return L("15秒", "15s")
+        case .s30: return L("30秒", "30s")
+        case .m1: return L("1分钟", "1 min")
+        case .never: return L("永不息屏", "Never")
         }
     }
 }
@@ -914,7 +943,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
             guard !self.recording else {
                 Log.write("[镜头] 录制中不可翻转")
-                giveUp("录制中不能翻转")
+                giveUp(L("录制中不能翻转", "Can't flip while recording"))
                 return
             }
 
@@ -922,7 +951,7 @@ final class CameraEngine: NSObject, ObservableObject {
             let fov: FieldOfView = next == .front ? .wide : self.fieldOfView
             guard let device = self.camera(next, fieldOfView: fov),
                   let input = self.cachedInput(for: device) else {
-                giveUp("该机型不支持翻转")
+                giveUp(L("该机型不支持翻转", "This device doesn't support flipping"))
                 return
             }
 
@@ -952,7 +981,7 @@ final class CameraEngine: NSObject, ObservableObject {
                 if let old = old { self.session.addInput(old) }
                 self.session.commitConfiguration()
                 if overlayShown { self.fadeOutFlipOverlay() }   // 没换成，也要把过渡帧撤掉
-                giveUp("翻转失败，请重试")
+                giveUp(L("翻转失败，请重试", "Flip failed, please try again"))
                 return
             }
             // 先把新设备的格式 / 帧率定好，再挂上去：这样"换 input"和"换格式"
@@ -1172,7 +1201,8 @@ final class CameraEngine: NSObject, ObservableObject {
         DispatchQueue.main.async { [weak self] in
             guard let self = self, self.frameRate != matched else { return }
             self.frameRate = matched
-            self.message("该画质最高支持 \(matched.rawValue)fps，已自动切换")
+            self.message(L("该画质最高支持 \(matched.rawValue)fps，已自动切换",
+                            "This quality supports up to \(matched.rawValue)fps, switched automatically"))
         }
     }
 
@@ -1358,7 +1388,8 @@ final class CameraEngine: NSObject, ObservableObject {
         guard !availableQualities.contains(previous), let fallback = availableQualities.first else { return }
         quality = fallback
         Log.write("[会话] 该摄像头不支持 \(previous.rawValue)，已切到 \(fallback.rawValue)")
-        message("该摄像头不支持 \(previous.rawValue)，已自动切到 \(fallback.rawValue)")
+        message(L("该摄像头不支持 \(previous.rawValue)，已自动切到 \(fallback.rawValue)",
+                  "This camera doesn't support \(previous.rawValue), switched to \(fallback.rawValue)"))
     }
 
     /// 可用的分辨率档：只摆本机真能给出的（假 4K 直接不显示）
@@ -1524,16 +1555,16 @@ final class CameraEngine: NSObject, ObservableObject {
     func proDisplay(_ control: ProControl) -> String {
         switch control {
         case .exposure:
-            return proIsManual(.exposure) ? String(format: "%+.1f EV", exposureBias) : "自动"
+            return proIsManual(.exposure) ? String(format: "%+.1f EV", exposureBias) : L("自动", "Auto")
         case .iso:
-            return isoValue > 0 ? "ISO \(Int(isoValue))" : "自动"
+            return isoValue > 0 ? "ISO \(Int(isoValue))" : L("自动", "Auto")
         case .shutter:
-            guard shutterSeconds > 0 else { return "自动" }
+            guard shutterSeconds > 0 else { return L("自动", "Auto") }
             return shutterText(shutterSeconds)
         case .whiteBalance:
-            return whiteBalanceKelvin > 0 ? "\(Int(whiteBalanceKelvin))K" : "自动"
+            return whiteBalanceKelvin > 0 ? "\(Int(whiteBalanceKelvin))K" : L("自动", "Auto")
         case .focus:
-            return focusLensPosition >= 0 ? String(format: "%.2f", focusLensPosition) : "自动"
+            return focusLensPosition >= 0 ? String(format: "%.2f", focusLensPosition) : L("自动", "Auto")
         case .zoom:
             return String(format: "%.1fx", zoom)
         }
@@ -1551,7 +1582,7 @@ final class CameraEngine: NSObject, ObservableObject {
         case .whiteBalance:
             return ("2500K", "9000K")
         case .focus:
-            return ("近", "远")
+            return (L("近", "Near"), L("远", "Far"))
         case .zoom:
             return (String(format: "%.1fx", range.lowerBound), String(format: "%.1fx", range.upperBound))
         }
@@ -1766,8 +1797,10 @@ final class CameraEngine: NSObject, ObservableObject {
         }
 
         var parts: [String] = []
-        parts.append(audioOK ? "麦克风风噪抑制" : "本机不支持麦克风风噪抑制")
-        parts.append(videoOK ? "暗光画面降噪" : "本机不支持暗光画面降噪")
+        parts.append(audioOK ? L("麦克风风噪抑制", "Mic wind noise reduction")
+                             : L("本机不支持麦克风风噪抑制", "Mic wind noise reduction unsupported"))
+        parts.append(videoOK ? L("暗光画面降噪", "Low-light noise reduction")
+                             : L("本机不支持暗光画面降噪", "Low-light noise reduction unsupported"))
         let note = parts.joined(separator: " · ")
         DispatchQueue.main.async { self.denoiseNote = on ? note : "" }
     }
@@ -1924,7 +1957,7 @@ final class CameraEngine: NSObject, ObservableObject {
             guard !clip.segments.isEmpty else {
                 DispatchQueue.main.async {
                     self.isBusy = false
-                    self.message("没有录到画面，请重试")
+                    self.message(L("没有录到画面，请重试", "No footage captured, please try again"))
                 }
                 return
             }
@@ -1942,7 +1975,7 @@ final class CameraEngine: NSObject, ObservableObject {
                 guard ok else {
                     DispatchQueue.main.async {
                         self.isBusy = false
-                        self.message("保存失败，请重试")
+                        self.message(L("保存失败，请重试", "Save failed, please try again"))
                     }
                     return
                 }
@@ -1950,7 +1983,7 @@ final class CameraEngine: NSObject, ObservableObject {
                     try? FileManager.default.removeItem(at: output)
                     DispatchQueue.main.async {
                         self.isBusy = false
-                        self.message(saved ? "保存成功" : "保存相册失败（检查相册权限）")
+                        self.message(saved ? L("保存成功", "Saved") : L("保存相册失败（检查相册权限）", "Failed to save to Photos (check permission)"))
                     }
                 }
             }
@@ -2120,7 +2153,8 @@ final class CameraEngine: NSObject, ObservableObject {
         let raw = UIDevice.current.batteryLevel
         guard raw >= 0 else { return }        // -1 = 读不到电量，别误触发
         guard raw <= Float(batteryThreshold.rawValue) / 100.0 else { return }
-        message("电量低于 \(batteryThreshold.rawValue)%，已自动停止并保存")
+        message(L("电量低于 \(batteryThreshold.rawValue)%，已自动停止并保存",
+                  "Battery below \(batteryThreshold.rawValue)%, stopped and saved automatically"))
         stopRecording()
     }
 

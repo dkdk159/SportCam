@@ -24,6 +24,20 @@ enum WatermarkItem: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// 界面上显示的项名（rawValue 保持稳定，只作 id 用，不随语言变）
+    var title: String {
+        switch self {
+        case .time:        return L("时间", "Time")
+        case .place:       return L("地点", "Place")
+        case .desc:        return L("描述", "Text")
+        case .altitude:    return L("海拔", "Alt")
+        case .weather:     return L("天气", "Weather")
+        case .temperature: return L("温度", "Temp")
+        case .pressure:    return L("气压", "Pressure")
+        case .wind:        return L("风速", "Wind")
+        }
+    }
+
     /// 默认开哪几项：时间和地点，其余按需开
     static let `default`: Set<WatermarkItem> = [.time, .place]
 }
@@ -32,7 +46,7 @@ enum WatermarkItem: String, CaseIterable, Identifiable {
 /// 水印要用的实时数据。定位和天气各填一半，谁先回来谁先显示，互不阻塞。
 struct WatermarkData {
     var place = ""
-    var desc = "运动相机"
+    var desc = L("运动相机", "Sport Camera")
     var altitude = 0.0
     var hasAltitude = false
     var weather = ""
@@ -71,17 +85,17 @@ enum WatermarkComposer {
         // 海拔 / 天气 / 温度 / 气压 / 风速 合成一行，和参考 App 一样用竖线隔开
         var metrics: [String] = []
         if items.contains(.altitude), data.hasAltitude {
-            metrics.append(String(format: "海拔:%.1fm", data.altitude))
+            metrics.append(String(format: L("海拔:%.1fm", "Alt:%.1fm"), data.altitude))
         }
         if items.contains(.weather), !data.weather.isEmpty { metrics.append(data.weather) }
         if items.contains(.temperature), data.hasWeather {
             metrics.append(String(format: "%.0f℃", data.temperature))
         }
         if items.contains(.pressure), data.hasWeather {
-            metrics.append(String(format: "气压:%.0fhPa", data.pressure))
+            metrics.append(String(format: L("气压:%.0fhPa", "Pressure:%.0fhPa"), data.pressure))
         }
         if items.contains(.wind), data.hasWeather {
-            metrics.append(String(format: "风速:%.0fkm/h", data.wind))
+            metrics.append(String(format: L("风速:%.0fkm/h", "Wind:%.0fkm/h"), data.wind))
         }
         if !metrics.isEmpty { out.append(metrics.joined(separator: " | ")) }
 
@@ -94,19 +108,19 @@ enum WatermarkComposer {
         case .time:
             return timeFormatter.string(from: Date())
         case .place:
-            return data.place.isEmpty ? "定位中…" : data.place
+            return data.place.isEmpty ? L("定位中…", "Locating…") : data.place
         case .desc:
-            return data.desc.isEmpty ? "点击填写" : data.desc
+            return data.desc.isEmpty ? L("点击填写", "Tap to edit") : data.desc
         case .altitude:
-            return data.hasAltitude ? String(format: "%.1fm", data.altitude) : "获取中…"
+            return data.hasAltitude ? String(format: "%.1fm", data.altitude) : L("获取中…", "Fetching…")
         case .weather:
-            return data.weather.isEmpty ? "获取中…" : data.weather
+            return data.weather.isEmpty ? L("获取中…", "Fetching…") : data.weather
         case .temperature:
-            return data.hasWeather ? String(format: "%.0f℃", data.temperature) : "获取中…"
+            return data.hasWeather ? String(format: "%.0f℃", data.temperature) : L("获取中…", "Fetching…")
         case .pressure:
-            return data.hasWeather ? String(format: "%.0fhPa", data.pressure) : "获取中…"
+            return data.hasWeather ? String(format: "%.0fhPa", data.pressure) : L("获取中…", "Fetching…")
         case .wind:
-            return data.hasWeather ? String(format: "%.0fkm/h", data.wind) : "获取中…"
+            return data.hasWeather ? String(format: "%.0fkm/h", data.wind) : L("获取中…", "Fetching…")
         }
     }
 }
@@ -151,7 +165,7 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         case .authorizedWhenInUse, .authorizedAlways:
             begin()
         default:
-            DispatchQueue.main.async { self.onFailure?("定位权限未开启") }
+            DispatchQueue.main.async { self.onFailure?(L("定位权限未开启", "Location permission not enabled")) }
         }
     }
 
@@ -249,7 +263,7 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         if status == .authorizedWhenInUse || status == .authorizedAlways {
             begin()
         } else if status == .denied || status == .restricted {
-            DispatchQueue.main.async { self.onFailure?("定位权限被拒绝") }
+            DispatchQueue.main.async { self.onFailure?(L("定位权限被拒绝", "Location permission denied")) }
         }
     }
 
@@ -283,7 +297,7 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        DispatchQueue.main.async { self.onFailure?("定位失败") }
+        DispatchQueue.main.async { self.onFailure?(L("定位失败", "Location failed")) }
     }
 
     /// 拼地名：市 + 区 + 街道（含门牌）+ 具体地点。
@@ -383,28 +397,28 @@ final class WeatherProvider {
         task = nil
     }
 
-    /// WMO 天气码 → 中文
+    /// WMO 天气码 → 文案（跟随界面语言）
     private static func describe(_ code: Int) -> String {
         switch code {
-        case 0: return "晴"
-        case 1: return "晴间多云"
-        case 2: return "多云"
-        case 3: return "阴"
-        case 45, 48: return "雾"
-        case 51, 53, 55: return "毛毛雨"
-        case 56, 57: return "冻雨"
-        case 61: return "小雨"
-        case 63: return "中雨"
-        case 65: return "大雨"
-        case 66, 67: return "冻雨"
-        case 71: return "小雪"
-        case 73: return "中雪"
-        case 75: return "大雪"
-        case 77: return "雪粒"
-        case 80, 81, 82: return "阵雨"
-        case 85, 86: return "阵雪"
-        case 95: return "雷阵雨"
-        case 96, 99: return "雷暴"
+        case 0: return L("晴", "Clear")
+        case 1: return L("晴间多云", "Mainly Clear")
+        case 2: return L("多云", "Partly Cloudy")
+        case 3: return L("阴", "Overcast")
+        case 45, 48: return L("雾", "Fog")
+        case 51, 53, 55: return L("毛毛雨", "Drizzle")
+        case 56, 57: return L("冻雨", "Freezing Drizzle")
+        case 61: return L("小雨", "Light Rain")
+        case 63: return L("中雨", "Rain")
+        case 65: return L("大雨", "Heavy Rain")
+        case 66, 67: return L("冻雨", "Freezing Rain")
+        case 71: return L("小雪", "Light Snow")
+        case 73: return L("中雪", "Snow")
+        case 75: return L("大雪", "Heavy Snow")
+        case 77: return L("雪粒", "Snow Grains")
+        case 80, 81, 82: return L("阵雨", "Rain Showers")
+        case 85, 86: return L("阵雪", "Snow Showers")
+        case 95: return L("雷阵雨", "Thunderstorm")
+        case 96, 99: return L("雷暴", "Severe Thunderstorm")
         default: return ""
         }
     }

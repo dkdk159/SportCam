@@ -8,6 +8,36 @@ import Combine
 //  界面：竖屏，布局对齐苹果自带相机；功能保持大疆那套
 // ============================================================
 
+// MARK: - 语言（中英运行时切换；默认中文，选择记忆）
+enum AppLanguage: String, CaseIterable, Identifiable {
+    case zh = "zh"
+    case en = "en"
+    var id: String { rawValue }
+    /// 选项本身两种语言都写自己的名字，不随界面语言变
+    var label: String { self == .zh ? "中文" : "English" }
+}
+
+/// 当前语言。改它会立刻让主界面 / 设置页重绘（两个视图都监听它）。
+final class Lang: ObservableObject {
+    static let shared = Lang()
+    private static let key = "app_language"
+
+    @Published var current: AppLanguage {
+        didSet { UserDefaults.standard.set(current.rawValue, forKey: Self.key) }
+    }
+
+    private init() {
+        let saved = UserDefaults.standard.string(forKey: Self.key) ?? ""
+        current = AppLanguage(rawValue: saved) ?? .zh
+    }
+}
+
+/// 取文案：L(中文, English)。调用点两套都写出来，不会漏翻。
+/// 注意：它是普通函数，视图要重绘必须有人监听 Lang.shared（主界面 / 设置页都在监听）。
+func L(_ zh: String, _ en: String) -> String {
+    Lang.shared.current == .en ? en : zh
+}
+
 private enum Palette {
     static let accent = Color(red: 0.20, green: 0.86, blue: 0.70)
     static let record = Color(red: 1.00, green: 0.23, blue: 0.23)
@@ -106,24 +136,44 @@ private struct CameraPreview: UIViewRepresentable {
 }
 
 // MARK: - 小控件
-private struct CircleIcon: View {
+/// 主界面所有功能钮统一走这一个：46pt 玻璃圆钮 + 一行短标签，字号/描边/投影完全一致，
+/// 不再出现"顶部 38、底部 46"这种一大一小。标签直接把"这个钮管什么"写在下面。
+private struct ToolButton: View {
     let icon: String
+    /// 短标签（闪光灯 / 翻转 / 相册…）。传 nil 就只留圆钮。
+    var title: String? = nil
     var active = false
     var tint: Color = Palette.accent
-    var diameter: CGFloat = 42
+    var diameter: CGFloat = 46
+    var disabled = false
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: diameter * 0.42, weight: .semibold))
-                .foregroundColor(active ? tint : .white)
+            VStack(spacing: 5) {
+                ZStack {
+                    Circle().fill(active ? tint : Palette.glass)
+                    Circle().stroke(active ? tint.opacity(0.9) : Palette.border, lineWidth: 1)
+                    Image(systemName: icon)
+                        .font(.system(size: diameter * 0.40, weight: .semibold))
+                        .foregroundColor(active ? Color.black : .white)
+                }
                 .frame(width: diameter, height: diameter)
-                .background(Palette.glass)
-                .clipShape(Circle())
-                .overlay(Circle().stroke(active ? tint.opacity(0.75) : Palette.border, lineWidth: 1))
+                .shadow(color: .black.opacity(0.22), radius: 5, y: 1)
+
+                if let title = title {
+                    Text(title)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.white.opacity(0.82))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .frame(width: diameter)
+                }
+            }
+            .contentShape(Rectangle())
         }
         .buttonStyle(PlainButtonStyle())
+        .disabled(disabled)
     }
 }
 
@@ -317,6 +367,8 @@ private struct RulerSlider: View {
 // MARK: - 主界面
 struct CameraScreen: View {
     @ObservedObject var engine: CameraEngine
+    /// 监听语言：中英切换时整屏重绘
+    @ObservedObject private var lang = Lang.shared
     @State private var showSettings = false
     @State private var showDuration = false
     @State private var showFormat = false
@@ -451,11 +503,11 @@ struct CameraScreen: View {
                             Image(systemName: "chevron.up.2")
                                 .font(.system(size: 26))
                                 .foregroundColor(.white.opacity(0.45))
-                            Text("省电熄屏中 · 上滑唤醒")
+                            Text(L("省电熄屏中 · 上滑唤醒", "Screen off · swipe up to wake"))
                                 .font(.system(size: 13))
                                 .foregroundColor(.white.opacity(0.45))
                             if engine.isRecording {
-                                Text("录制中 \(timeText(engine.recordSeconds))")
+                                Text("\(L("录制中", "REC")) \(timeText(engine.recordSeconds))")
                                     .font(Palette.mono(12))
                                     .foregroundColor(Palette.record.opacity(0.85))
                             }
@@ -532,22 +584,24 @@ struct CameraScreen: View {
                         .background(Palette.glass)
                         .clipShape(Capsule())
                 }
-                HStack(spacing: 8) {
-                    CircleIcon(icon: engine.torchOn ? "bolt.fill" : "bolt.slash.fill",
+                // 三个功能钮：统一 46 圆钮 + 短标签，和底部一排同规格，不再一大一小
+                HStack(spacing: 10) {
+                    ToolButton(icon: engine.torchOn ? "bolt.fill" : "bolt.slash.fill",
+                               title: L("闪光灯", "Flash"),
                                active: engine.torchOn,
-                               tint: Palette.appleYellow,
-                               diameter: 38) {
+                               tint: Palette.appleYellow) {
                         engine.toggleTorch()
                     }
                     // 翻转：前/后摄像头切换。原来藏在设置里，挪到屏幕上单手就能切
-                    CircleIcon(icon: "arrow.triangle.2.circlepath.camera",
+                    ToolButton(icon: "arrow.triangle.2.circlepath.camera",
+                               title: L("翻转", "Flip"),
                                active: engine.cameraPosition == .front,
-                               diameter: 38) {
+                               disabled: engine.isRecording) {
                         engine.toggleCamera()
                     }
-                    .disabled(engine.isRecording)
-                    .opacity(engine.isRecording ? 0.4 : 1)
-                    CircleIcon(icon: "gearshape.fill", diameter: 38) { showSettings = true }
+                    ToolButton(icon: "gearshape.fill", title: L("设置", "Settings")) {
+                        showSettings = true
+                    }
                 }
             }
         }
@@ -563,7 +617,7 @@ struct CameraScreen: View {
                 ProgressView()
                     .progressViewStyle(CircularProgressViewStyle(tint: Palette.appleYellow))
                     .scaleEffect(0.8)
-                Text("正在保存到相册…")
+                Text(L("正在保存到相册…", "Saving to Photos…"))
                     .font(Palette.mono(12))
                     .foregroundColor(Palette.appleYellow)
             }
@@ -611,7 +665,8 @@ struct CameraScreen: View {
                                                 : engine.preRecordDelay.label)
                             .font(Palette.mono(15, .bold))
                             .foregroundColor(.white)
-                        Text(engine.preRecordOn ? "预录制中" : "预录时长")
+                        Text(engine.preRecordOn ? L("预录制中", "Pre-recording")
+                                               : L("预录时长", "Pre-record"))
                             .font(.system(size: 11))
                             .foregroundColor(.white.opacity(0.92))
                     }
@@ -641,19 +696,20 @@ struct CameraScreen: View {
                 .onTapGesture { showDuration = false }
 
             VStack(spacing: 16) {
-                Text("设置预录时长")
+                Text(L("设置预录时长", "Pre-record Duration"))
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.white)
 
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3),
                           spacing: 10) {
-                    durationCell("关闭", value: nil)
+                    durationCell(L("关闭", "Off"), value: nil)
                     ForEach(PreRecordDelay.allCases) { delay in
                         durationCell(delay.label, value: delay)
                     }
                 }
 
-                Text("预录会在按下录像前先缓存这段时间的画面")
+                Text(L("预录会在按下录像前先缓存这段时间的画面",
+                       "Pre-record keeps the moments before you press record"))
                     .font(.system(size: 11))
                     .foregroundColor(.white.opacity(0.55))
             }
@@ -698,7 +754,7 @@ struct CameraScreen: View {
                 .onTapGesture { showFormat = false }
 
             VStack(spacing: 14) {
-                Text("分辨率")
+                Text(L("分辨率", "Resolution"))
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.white)
 
@@ -711,7 +767,7 @@ struct CameraScreen: View {
                     }
                 }
 
-                Text("帧率")
+                Text(L("帧率", "Frame Rate"))
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.white)
                     .padding(.top, 2)
@@ -727,20 +783,22 @@ struct CameraScreen: View {
                 // 真实输出尺寸：选的档是"名义值"，这里显示的是摄像头真正送出来的画面大小，
                 // 是不是真 4K 一眼就能对上（比如 3840×2160 才是真 4K，1920×1080 就是没给到）。
                 if !engine.actualResolution.isEmpty {
-                    Text("实际输出 \(engine.actualResolution)")
+                    Text("\(L("实际输出", "Output")) \(engine.actualResolution)")
                         .font(Palette.mono(11))
                         .foregroundColor(Palette.accent)
                 }
 
-                Text(engine.isRecording ? "录制中不能改分辨率和帧率"
-                                        : "分辨率越高越清晰，帧率越高越流畅，文件也越大")
+                Text(engine.isRecording
+                     ? L("录制中不能改分辨率和帧率", "Can't change resolution or frame rate while recording")
+                     : L("分辨率越高越清晰，帧率越高越流畅，文件也越大",
+                         "Higher resolution is sharper, higher frame rate is smoother, files are larger"))
                     .font(.system(size: 11))
                     .foregroundColor(.white.opacity(0.55))
 
                 Button {
                     showFormat = false
                 } label: {
-                    Text("完成")
+                    Text(L("完成", "Done"))
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(.black)
                         .frame(maxWidth: .infinity)
@@ -795,8 +853,8 @@ struct CameraScreen: View {
         VStack(spacing: 14) {
             // 总开关
             HStack(spacing: 0) {
-                watermarkMaster("关闭", on: !engine.watermarkOn) { engine.watermarkOn = false }
-                watermarkMaster("开启", on: engine.watermarkOn) { engine.watermarkOn = true }
+                watermarkMaster(L("关闭", "Off"), on: !engine.watermarkOn) { engine.watermarkOn = false }
+                watermarkMaster(L("开启", "On"), on: engine.watermarkOn) { engine.watermarkOn = true }
             }
             .padding(4)
             .background(Color.white.opacity(0.12))
@@ -814,14 +872,15 @@ struct CameraScreen: View {
             }
             .frame(maxHeight: 268)
 
-            Text("数据来自系统定位与 Open-Meteo 天气，勾上即刻显示")
+            Text(L("数据来自系统定位与 Open-Meteo 天气，勾上即刻显示",
+                   "Data from system location and Open-Meteo weather. Shown instantly once checked."))
                 .font(.system(size: 11))
                 .foregroundColor(.white.opacity(0.5))
 
             Button {
                 showWatermark = false
             } label: {
-                Text("完成")
+                Text(L("完成", "Done"))
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(.black)
                     .frame(maxWidth: .infinity)
@@ -871,7 +930,7 @@ struct CameraScreen: View {
             }
             .buttonStyle(PlainButtonStyle())
 
-            Text(item.rawValue)
+            Text(item.title)
                 .font(.system(size: 14))
                 .foregroundColor(.white)
                 .frame(width: 42, alignment: .leading)
@@ -935,7 +994,7 @@ struct CameraScreen: View {
 
             HStack(spacing: 14) {
                 // 左：相册 + 专业参数
-                CircleIcon(icon: "photo.on.rectangle", diameter: 46) {
+                ToolButton(icon: "photo.on.rectangle", title: L("相册", "Photos")) {
                     engine.openPhotos()
                 }
                 proToggleButton
@@ -944,7 +1003,7 @@ struct CameraScreen: View {
 
                 // 右：水印 + 预录时长
                 watermarkButton
-                CircleIcon(icon: "timer", diameter: 46) { showDuration = true }
+                ToolButton(icon: "timer", title: L("计时", "Timer")) { showDuration = true }
             }
         }
         .padding(.horizontal, 20)
@@ -953,7 +1012,9 @@ struct CameraScreen: View {
     /// 水印：点开面板，逐项勾选（时间/地点/描述/海拔/天气/温度/气压/风速）
     /// 和左右两侧其它按钮一样做成 46 的圆，底栏一排按钮尺寸统一、不再一大一小。
     private var watermarkButton: some View {
-        CircleIcon(icon: "textformat", active: engine.watermarkOn, diameter: 46) {
+        ToolButton(icon: "textformat",
+                   title: L("水印", "Watermark"),
+                   active: engine.watermarkOn) {
             showWatermark = true
             engine.ensureWatermarkStarted()
         }
@@ -961,18 +1022,11 @@ struct CameraScreen: View {
 
     /// 一个按钮管全部专业参数：点开面板，里面六项随便切
     private var proToggleButton: some View {
-        Button {
+        ToolButton(icon: "slider.horizontal.3",
+                   title: L("参数", "Pro"),
+                   active: engine.proControl != nil) {
             setPro(engine.proControl == nil ? .exposure : nil)
-        } label: {
-            Image(systemName: "slider.horizontal.3")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundColor(engine.proControl != nil ? .black : .white)
-                .frame(width: 46, height: 46)
-                .background(engine.proControl != nil ? Color.white : Palette.glass)
-                .clipShape(Circle())
-                .overlay(Circle().stroke(Palette.border, lineWidth: 0.5))
         }
-        .buttonStyle(PlainButtonStyle())
     }
 
     private var shutterButton: some View {
@@ -1013,7 +1067,7 @@ struct CameraScreen: View {
                                 .font(Palette.mono(12, .semibold))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.6)
-                            Text(item.rawValue)
+                            Text(item.title)
                                 .font(.system(size: 10))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.6)
@@ -1034,9 +1088,9 @@ struct CameraScreen: View {
                     engine.showGrid.toggle()
                 } label: {
                     VStack(spacing: 3) {
-                        Text(engine.showGrid ? "开" : "关")
+                        Text(engine.showGrid ? L("开", "On") : L("关", "Off"))
                             .font(Palette.mono(12, .semibold))
-                        Text("网格")
+                        Text(L("网格", "Grid"))
                             .font(.system(size: 10))
                             .lineLimit(1)
                             .minimumScaleFactor(0.6)
@@ -1123,19 +1177,22 @@ private struct DescEditorView: View {
     let initial: String
     let onSave: (String) -> Void
     @Environment(\.presentationMode) private var presentation
+    /// 监听语言：切换语言时这一页也跟着重绘
+    @ObservedObject private var lang = Lang.shared
     @State private var text = ""
 
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("水印描述"),
-                        footer: Text("这一行会原样写进水印，例如「钓鱼运动相机」。留空则不显示。")) {
-                    TextField("输入描述", text: $text)
+                Section(header: Text(L("水印描述", "Watermark Description")),
+                        footer: Text(L("这一行会原样写进水印，例如「钓鱼运动相机」。留空则不显示。",
+                                       "This line is written into the watermark as-is, e.g. \"Fishing Cam\". Leave empty to hide."))) {
+                    TextField(L("输入描述", "Enter description"), text: $text)
                 }
             }
-            .navigationBarTitle("描述", displayMode: .inline)
-            .navigationBarItems(leading: Button("取消") { presentation.wrappedValue.dismiss() },
-                                trailing: Button("保存") {
+            .navigationBarTitle(L("描述", "Description"), displayMode: .inline)
+            .navigationBarItems(leading: Button(L("取消", "Cancel")) { presentation.wrappedValue.dismiss() },
+                                trailing: Button(L("保存", "Save")) {
                                     onSave(text)
                                     presentation.wrappedValue.dismiss()
                                 })
@@ -1288,6 +1345,8 @@ private struct SettingNote: View {
 struct SettingsSheet: View {
     @ObservedObject var engine: CameraEngine
     @Environment(\.presentationMode) private var presentation
+    /// 监听语言：中英切换时整页重绘
+    @ObservedObject private var lang = Lang.shared
     @State private var startInput = ""
     @State private var stopInput = ""
     @State private var words: (start: [String], stop: [String]) = ([], [])
@@ -1300,14 +1359,14 @@ struct SettingsSheet: View {
                 Color(red: 0.055, green: 0.06, blue: 0.075).ignoresSafeArea()
                 ScrollView {
                     VStack(spacing: 16) {
-                        SettingsCard(icon: "camera.aperture", title: "画面") {
-                            SettingRow(icon: "rectangle.on.rectangle", title: "分辨率") {
+                        SettingsCard(icon: "camera.aperture", title: L("画面", "Video")) {
+                            SettingRow(icon: "rectangle.on.rectangle", title: L("分辨率", "Resolution")) {
                                 SettingSegments(options: engine.availableQualities,
                                                 title: { $0.rawValue },
                                                 selection: $engine.quality,
                                                 disabled: engine.isRecording)
                             }
-                            SettingRow(icon: "speedometer", title: "帧率") {
+                            SettingRow(icon: "speedometer", title: L("帧率", "Frame Rate")) {
                                 SettingSegments(options: FrameRate.allCases,
                                                 title: { $0.label },
                                                 selection: $engine.frameRate,
@@ -1318,52 +1377,55 @@ struct SettingsSheet: View {
                                     Image(systemName: "checkmark.seal.fill")
                                         .font(.system(size: 10))
                                         .foregroundColor(Palette.accent)
-                                    Text("实际输出 \(engine.actualResolution)")
+                                    Text("\(L("实际输出", "Output")) \(engine.actualResolution)")
                                         .font(.system(size: 11))
                                         .foregroundColor(.white.opacity(0.45))
                                 }
                             }
-                            SettingRow(icon: "camera.metering.center.weighted", title: "视角") {
+                            SettingRow(icon: "camera.metering.center.weighted", title: L("视角", "Field of View")) {
                                 SettingSegments(options: engine.availableFieldOfViews,
-                                                title: { $0.rawValue },
+                                                title: { $0.title },
                                                 selection: $engine.fieldOfView,
                                                 disabled: engine.isRecording || engine.cameraPosition == .front)
                             }
-                            SettingToggleRow(icon: "viewfinder", title: "自动最广视野", isOn: $engine.autoWidest)
-                            SettingNote(text: "镜头按本机真实能力适配：只列出这台机器真有的（前置/后置、超广角/广角/长焦/多摄）。自动最广视野开启后，自动切到最广的镜头。镜头切换是本地操作，无信号、飞行模式、省电模式下都能用。")
-                            SettingRow(icon: "hand.raised.fill", title: "防抖") {
+                            SettingToggleRow(icon: "viewfinder", title: L("自动最广视野", "Auto Widest View"), isOn: $engine.autoWidest)
+                            SettingNote(text: L("镜头按本机真实能力适配：只列出这台机器真有的（前置/后置、超广角/广角/长焦/多摄）。自动最广视野开启后，自动切到最广的镜头。镜头切换是本地操作，无信号、飞行模式、省电模式下都能用。",
+                                                "Lenses adapt to this device's real capabilities: only what it actually has (front/rear, ultra-wide/wide/tele/multi-cam) is listed. When Auto Widest View is on, it switches to the widest lens automatically. Lens switching is local and works with no signal, in Airplane Mode and Low Power Mode."))
+                            SettingRow(icon: "hand.raised.fill", title: L("防抖", "Stabilization")) {
                                 SettingSegments(options: AntiShake.allCases,
-                                                title: { $0.rawValue },
+                                                title: { $0.title },
                                                 selection: $engine.antiShake,
                                                 disabled: engine.isRecording)
                             }
                         }
 
-                        SettingsCard(icon: "moon.zzz.fill", title: "自动熄屏") {
-                            SettingRow(icon: "timer", title: "熄屏时间") {
+                        SettingsCard(icon: "moon.zzz.fill", title: L("自动熄屏", "Auto Screen Off")) {
+                            SettingRow(icon: "timer", title: L("熄屏时间", "Screen Off Timer")) {
                                 SettingSegments(options: PowerSaveDelay.allCases,
                                                 title: { $0.label },
                                                 selection: $engine.powerSave)
                             }
-                            SettingNote(text: "到点自动熄屏省电，熄屏后继续录制，上滑屏幕即可唤醒。")
+                            SettingNote(text: L("到点自动熄屏省电，熄屏后继续录制，上滑屏幕即可唤醒。",
+                                                "Turns the screen off to save power; recording continues. Swipe up to wake."))
                         }
 
-                        SettingsCard(icon: "squareshape.split.3x3", title: "拍摄辅助") {
-                            SettingToggleRow(icon: "grid", title: "构图网格", isOn: $engine.showGrid)
-                            SettingToggleRow(icon: "level", title: "水平仪", isOn: $engine.showLevel)
-                            SettingToggleRow(icon: "speaker.wave.2.fill", title: "录制提示音", isOn: $engine.beepOn)
-                            SettingToggleRow(icon: "lightbulb.fill", title: "夜钓自动补光", isOn: $engine.nightAutoLight)
-                            SettingNote(text: "提示音用的是苹果自带相机的录像声。夜钓自动补光：录制中画面变暗时自动开手电，变亮自动关，停止录制也会关灯省电；是否生效取决于当前镜头有没有闪光灯。")
+                        SettingsCard(icon: "squareshape.split.3x3", title: L("拍摄辅助", "Shooting Aids")) {
+                            SettingToggleRow(icon: "grid", title: L("构图网格", "Grid"), isOn: $engine.showGrid)
+                            SettingToggleRow(icon: "level", title: L("水平仪", "Level"), isOn: $engine.showLevel)
+                            SettingToggleRow(icon: "speaker.wave.2.fill", title: L("录制提示音", "Recording Sound"), isOn: $engine.beepOn)
+                            SettingToggleRow(icon: "lightbulb.fill", title: L("夜钓自动补光", "Auto Night Light"), isOn: $engine.nightAutoLight)
+                            SettingNote(text: L("提示音用的是苹果自带相机的录像声。夜钓自动补光：录制中画面变暗时自动开手电，变亮自动关，停止录制也会关灯省电；是否生效取决于当前镜头有没有闪光灯。",
+                                                "The sound is Apple's own camera recording tone. Auto Night Light: during recording it turns the torch on when the scene gets dark, off when bright, and always off when recording stops; depends on whether the current lens has a torch."))
                         }
 
-                        SettingsCard(icon: "mappin.and.ellipse", title: "水印") {
-                            SettingToggleRow(icon: "text.viewfinder", title: "时间地点水印", isOn: $engine.watermarkOn)
+                        SettingsCard(icon: "mappin.and.ellipse", title: L("水印", "Watermark")) {
+                            SettingToggleRow(icon: "text.viewfinder", title: L("时间地点水印", "Time & Location Watermark"), isOn: $engine.watermarkOn)
                             if engine.watermarkOn {
                                 HStack {
-                                    Text("当前地点").font(.system(size: 13)).foregroundColor(.white.opacity(0.7))
+                                    Text(L("当前地点", "Current Place")).font(.system(size: 13)).foregroundColor(.white.opacity(0.7))
                                     Spacer()
                                     Text(engine.watermarkData.place.isEmpty
-                                         ? (engine.locationNote.isEmpty ? "定位中…" : engine.locationNote)
+                                         ? (engine.locationNote.isEmpty ? L("定位中…", "Locating…") : engine.locationNote)
                                          : engine.watermarkData.place)
                                         .font(.system(size: 13))
                                         .foregroundColor(.white.opacity(0.45))
@@ -1371,42 +1433,44 @@ struct SettingsSheet: View {
                                         .multilineTextAlignment(.trailing)
                                 }
                                 HStack {
-                                    Text("天气数据").font(.system(size: 13)).foregroundColor(.white.opacity(0.7))
+                                    Text(L("天气数据", "Weather Data")).font(.system(size: 13)).foregroundColor(.white.opacity(0.7))
                                     Spacer()
-                                    Text(engine.watermarkData.hasWeather ? "已就绪" : "获取中…")
+                                    Text(engine.watermarkData.hasWeather ? L("已就绪", "Ready") : L("获取中…", "Fetching…"))
                                         .font(.system(size: 13))
                                         .foregroundColor(.white.opacity(0.45))
                                 }
                             }
-                            SettingNote(text: "水印烧进画面左下角，预览同款显示。需要定位权限，天气需联网；关闭后不定位、不联网、不写入。显示哪些内容，在拍摄界面右下角「水印时间」里逐项勾选。")
+                            SettingNote(text: L("水印烧进画面左下角，预览同款显示。需要定位权限，天气需联网；关闭后不定位、不联网、不写入。显示哪些内容，在拍摄界面右下角「水印时间」里逐项勾选。",
+                                                "The watermark is burned into the bottom-left of the frame and shown the same way in preview. Needs location permission; weather needs network. When off, no location, no network, nothing written. Pick which items to show via the Watermark button on the shooting screen."))
                         }
 
-                        SettingsCard(icon: "clock.arrow.circlepath", title: "预录") {
-                            SettingToggleRow(icon: "record.circle", title: "开启预录", isOn: $engine.preRecordOn)
-                            SettingRow(icon: "timer", title: "预录时长") {
+                        SettingsCard(icon: "clock.arrow.circlepath", title: L("预录", "Pre-record")) {
+                            SettingToggleRow(icon: "record.circle", title: L("开启预录", "Enable Pre-record"), isOn: $engine.preRecordOn)
+                            SettingRow(icon: "timer", title: L("预录时长", "Pre-record Duration")) {
                                 SettingSegments(options: PreRecordDelay.allCases,
                                                 title: { $0.label },
                                                 selection: $engine.preRecordDelay,
                                                 disabled: !engine.preRecordOn)
                             }
-                            SettingNote(text: "开启后持续缓存最近画面，按下录像时会把「按下之前」的画面一起保存。")
+                            SettingNote(text: L("开启后持续缓存最近画面，按下录像时会把「按下之前」的画面一起保存。",
+                                                "Keeps buffering recent footage so that when you press record, the moments before are saved too."))
                         }
 
-                        SettingsCard(icon: "waveform", title: "语音控制") {
-                            SettingToggleRow(icon: "mic.fill", title: "语音控制", isOn: $engine.voiceOn)
-                            SettingRow(icon: "play.circle", title: "开始口令") {
+                        SettingsCard(icon: "waveform", title: L("语音控制", "Voice Control")) {
+                            SettingToggleRow(icon: "mic.fill", title: L("语音控制", "Voice Control"), isOn: $engine.voiceOn)
+                            SettingRow(icon: "play.circle", title: L("开始口令", "Start Phrase")) {
                                 Text(words.start.joined(separator: " / "))
                                     .font(.system(size: 12))
                                     .foregroundColor(Palette.accent)
                                     .lineLimit(1)
-                                SettingField(placeholder: "自定义开始口令（英文逗号分隔）", text: $startInput)
+                                SettingField(placeholder: L("自定义开始口令（英文逗号分隔）", "Custom start phrases (comma separated)"), text: $startInput)
                             }
-                            SettingRow(icon: "stop.circle", title: "结束口令") {
+                            SettingRow(icon: "stop.circle", title: L("结束口令", "Stop Phrase")) {
                                 Text(words.stop.joined(separator: " / "))
                                     .font(.system(size: 12))
                                     .foregroundColor(Palette.accent)
                                     .lineLimit(1)
-                                SettingField(placeholder: "自定义结束口令（英文逗号分隔）", text: $stopInput)
+                                SettingField(placeholder: L("自定义结束口令（英文逗号分隔）", "Custom stop phrases (comma separated)"), text: $stopInput)
                             }
                             Button {
                                 let start = startInput.isEmpty ? words.start
@@ -1416,7 +1480,7 @@ struct SettingsSheet: View {
                                 words = (start, stop)
                                 engine.setVoiceWords(start: start, stop: stop)
                             } label: {
-                                Text("保存口令")
+                                Text(L("保存口令", "Save Phrases"))
                                     .font(.system(size: 13, weight: .semibold))
                                     .foregroundColor(.black)
                                     .frame(maxWidth: .infinity)
@@ -1424,35 +1488,49 @@ struct SettingsSheet: View {
                                     .background(Capsule().fill(Palette.accent))
                             }
                             .buttonStyle(.plain)
-                            SettingNote(text: "开启后说「开始录像」即可开始，说「停止录像」即可结束。")
+                            SettingNote(text: L("开启后说「开始录像」即可开始，说「停止录像」即可结束。",
+                                                "When on, say \"start recording\" to begin and \"stop recording\" to end."))
                         }
 
-                        SettingsCard(icon: "bolt.fill", title: "性能与续航") {
-                            SettingToggleRow(icon: "waveform.badge.mic", title: "降噪", isOn: $engine.denoiseOn)
+                        SettingsCard(icon: "bolt.fill", title: L("性能与续航", "Performance & Battery")) {
+                            SettingToggleRow(icon: "waveform.badge.mic", title: L("降噪", "Noise Reduction"), isOn: $engine.denoiseOn)
                             SettingNote(text: engine.denoiseOn && !engine.denoiseNote.isEmpty
-                                        ? "降噪已生效：\(engine.denoiseNote)"
-                                        : "降噪：抑制麦克风风噪，并在暗光下压制画面噪点（是否可用取决于机型和系统）。")
+                                        ? L("降噪已生效：\(engine.denoiseNote)", "Noise reduction active: \(engine.denoiseNote)")
+                                        : L("降噪：抑制麦克风风噪，并在暗光下压制画面噪点（是否可用取决于机型和系统）。",
+                                            "Noise reduction: suppresses mic wind noise and reduces low-light grain (availability depends on device and OS)."))
                         }
 
-                        SettingsCard(icon: "battery.100", title: "低电量保护") {
-                            SettingToggleRow(icon: "battery.25", title: "低电量强制保存", isOn: $engine.lowBatterySaveOn)
-                            SettingRow(icon: "percent", title: "阈值") {
+                        SettingsCard(icon: "battery.100", title: L("低电量保护", "Low Battery Protection")) {
+                            SettingToggleRow(icon: "battery.25", title: L("低电量强制保存", "Force Save on Low Battery"), isOn: $engine.lowBatterySaveOn)
+                            SettingRow(icon: "percent", title: L("阈值", "Threshold")) {
                                 SettingSegments(options: BatteryThreshold.allCases,
                                                 title: { $0.label },
                                                 selection: $engine.batteryThreshold,
                                                 disabled: !engine.lowBatterySaveOn)
                             }
-                            SettingNote(text: "录制中电量降到阈值时自动停止并保存当前视频，避免突然断电把文件丢掉。当前电量 \(Int(engine.battery * 100))%。")
+                            SettingNote(text: L("录制中电量降到阈值时自动停止并保存当前视频，避免突然断电把文件丢掉。当前电量 \(Int(engine.battery * 100))%。",
+                                                "When battery drops to the threshold while recording, it stops and saves the current video so a sudden shutdown won't lose the file. Current battery \(Int(engine.battery * 100))%."))
                         }
 
-                        SettingsCard(icon: "hand.tap.fill", title: "按键") {
-                            SettingToggleRow(icon: "speaker.wave.3.fill", title: "音量键控制录像", isOn: $engine.volumeKeyRecording)
-                            SettingNote(text: "开启后，按音量键（或 iPhone 16 的相机按钮）即可开始 / 停止录像。默认关闭，想用时再打开。")
+                        SettingsCard(icon: "hand.tap.fill", title: L("按键", "Buttons")) {
+                            SettingToggleRow(icon: "speaker.wave.3.fill", title: L("音量键控制录像", "Volume Key Recording"), isOn: $engine.volumeKeyRecording)
+                            SettingNote(text: L("开启后，按音量键（或 iPhone 16 的相机按钮）即可开始 / 停止录像。默认关闭，想用时再打开。",
+                                                "When on, press a volume key (or the iPhone 16 Camera Control) to start / stop recording. Off by default; turn it on when you need it."))
                         }
 
-                        SettingsCard(icon: "eye.fill", title: "显示") {
-                            SettingToggleRow(icon: "internaldrive.fill", title: "显示剩余空间", isOn: $engine.showStorage)
-                            SettingNote(text: "左上角那个「剩余空间 / 可录时长」的胶囊。默认关闭，想看再打开。")
+                        SettingsCard(icon: "eye.fill", title: L("显示", "Display")) {
+                            SettingToggleRow(icon: "internaldrive.fill", title: L("显示剩余空间", "Show Free Space"), isOn: $engine.showStorage)
+                            SettingNote(text: L("左上角那个「剩余空间 / 可录时长」的胶囊。默认关闭，想看再打开。",
+                                                "The free space / recordable time pill at the top-left. Off by default; turn it on when you want it."))
+                        }
+
+                        // 语言：底部切换，选中即生效并记忆
+                        SettingsCard(icon: "globe", title: L("语言", "Language")) {
+                            SettingSegments(options: AppLanguage.allCases,
+                                            title: { $0.label },
+                                            selection: $lang.current)
+                            SettingNote(text: L("切换后界面文字立即生效，选择会被记住。",
+                                                "Takes effect immediately and your choice is remembered."))
                         }
                     }
                     .padding(.horizontal, 16)
@@ -1460,8 +1538,8 @@ struct SettingsSheet: View {
                     .padding(.bottom, 34)
                 }
             }
-            .navigationBarTitle("设置", displayMode: .inline)
-            .navigationBarItems(trailing: Button("完成") { presentation.wrappedValue.dismiss() }
+            .navigationBarTitle(L("设置", "Settings"), displayMode: .inline)
+            .navigationBarItems(trailing: Button(L("完成", "Done")) { presentation.wrappedValue.dismiss() }
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundColor(Palette.accent))
         }
